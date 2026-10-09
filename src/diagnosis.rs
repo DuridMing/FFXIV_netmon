@@ -29,7 +29,30 @@ impl LayerState {
     }
 }
 
-pub fn diagnose(kind: IncidentKind, layers: &[LayerState; 4], trace: Option<&Trace>) -> String {
+/// Wi-Fi 訊號低於這個值，家中網路的問題就很可能是 Wi-Fi 造成的
+const WEAK_WIFI: u32 = 50;
+
+/// `wifi_quality`：目前 Wi-Fi 訊號 0–100；用有線網路時為 None
+pub fn diagnose(
+    kind: IncidentKind,
+    layers: &[LayerState; 4],
+    trace: Option<&Trace>,
+    wifi_quality: Option<u32>,
+) -> String {
+    let mut text = diagnose_network(kind, layers, trace);
+    let home_issue = match kind {
+        IncidentKind::LatencySpike(i) => i == GATEWAY,
+        _ => layers[GATEWAY].is_bad(),
+    };
+    if home_issue && let Some(q) = wifi_quality.filter(|&q| q < WEAK_WIFI) {
+        text.push_str(&format!(
+            "目前 Wi-Fi 訊號只有 {q}%，建議改用有線網路或靠近路由器。"
+        ));
+    }
+    text
+}
+
+fn diagnose_network(kind: IncidentKind, layers: &[LayerState; 4], trace: Option<&Trace>) -> String {
     if let IncidentKind::LatencySpike(i) = kind {
         return spike_diagnosis(i);
     }
@@ -110,13 +133,13 @@ mod tests {
             state(30.0, None),
             good(),
         ];
-        assert!(diagnose(IncidentKind::HighLoss(0), &layers, None).starts_with("家中網路"));
+        assert!(diagnose(IncidentKind::HighLoss(0), &layers, None, None).starts_with("家中網路"));
     }
 
     #[test]
     fn isp_loss_with_healthy_gateway() {
         let layers = [good(), state(25.0, Some(5)), good(), good()];
-        assert!(diagnose(IncidentKind::HighLoss(1), &layers, None).starts_with("ISP 端"));
+        assert!(diagnose(IncidentKind::HighLoss(1), &layers, None, None).starts_with("ISP 端"));
     }
 
     #[test]
@@ -130,16 +153,33 @@ mod tests {
             }],
             reached: false,
         };
-        let text = diagnose(IncidentKind::GameUnreachable, &layers, Some(&trace));
+        let text = diagnose(IncidentKind::GameUnreachable, &layers, Some(&trace), None);
         assert!(text.starts_with("遊戲伺服器或國際路由"));
         assert!(text.contains("第 5 跳"));
+    }
+
+    #[test]
+    fn weak_wifi_adds_advice_only_for_home_issue() {
+        let home = [state(30.0, None), good(), good(), good()];
+        assert!(
+            diagnose(IncidentKind::HighLoss(0), &home, None, Some(35))
+                .contains("Wi-Fi 訊號只有 35%")
+        );
+        assert!(
+            !diagnose(IncidentKind::HighLoss(0), &home, None, Some(80)).contains("Wi-Fi 訊號只有")
+        );
+        let isp = [good(), state(30.0, None), good(), good()];
+        assert!(
+            !diagnose(IncidentKind::HighLoss(1), &isp, None, Some(35)).contains("Wi-Fi 訊號只有")
+        );
     }
 
     #[test]
     fn disconnect_with_healthy_network() {
         let layers = [good(), good(), good(), good()];
         assert!(
-            diagnose(IncidentKind::GameDisconnected, &layers, None).starts_with("本機網路正常")
+            diagnose(IncidentKind::GameDisconnected, &layers, None, None)
+                .starts_with("本機網路正常")
         );
     }
 }

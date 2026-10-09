@@ -8,7 +8,7 @@ crossbeam-channel = "0.5.17"
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
 egui_plot = "0.37.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_WiFi", "Win32_Networking_WinSock", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 opt-level = "z"

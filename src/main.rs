@@ -10,15 +10,23 @@ mod app;
 mod detector;
 mod diagnosis;
 mod events;
+mod icon;
 mod monitor;
+mod report;
 mod stats;
 mod storage;
 mod trace;
 mod win;
 
 use std::net::SocketAddrV4;
+use std::sync::Arc;
 
 use eframe::egui;
+
+use icon::Health;
+use win::tray;
+
+const APP_ICON_SIZE: u32 = 64;
 
 fn main() -> eframe::Result {
     let (manual_target, startup_error) = match parse_target_arg() {
@@ -26,10 +34,16 @@ fn main() -> eframe::Result {
         Err(e) => (None, Some(e)),
     };
 
+    let icon = egui::IconData {
+        rgba: icon::circle_rgba(APP_ICON_SIZE, Health::Good),
+        width: APP_ICON_SIZE,
+        height: APP_ICON_SIZE,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([780.0, 640.0])
-            .with_min_inner_size([560.0, 440.0]),
+            .with_inner_size([780.0, 680.0])
+            .with_min_inner_size([560.0, 460.0])
+            .with_icon(Arc::new(icon)),
         ..Default::default()
     };
     eframe::run_native(
@@ -38,7 +52,21 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
             let rx = monitor::spawn(manual_target, move || ctx.request_repaint());
-            Ok(Box::new(app::App::new(cc, rx, startup_error)))
+
+            let (tray_tx, tray_rx) = crossbeam_channel::unbounded();
+            let ctx = cc.egui_ctx.clone();
+            let tray = tray::spawn("FF14 連線監測", move |cmd| {
+                let _ = tray_tx.send(cmd);
+                ctx.request_repaint();
+            });
+
+            Ok(Box::new(app::App::new(
+                cc,
+                rx,
+                startup_error,
+                tray,
+                tray_rx,
+            )))
         }),
     )
 }

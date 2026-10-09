@@ -1,30 +1,43 @@
-//! egui 介面：遊戲狀態、各層狀態表、即時延遲圖、事件列表。
+//! egui 介面：遊戲狀態、各層狀態表、即時延遲圖、事件列表；系統匣常駐、通知、匯出報告。
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::thread;
 
 use crossbeam_channel::Receiver;
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
 
+use crate::icon::Health;
 use crate::monitor::{GameStatus, Incident, LAYER_NAMES, LayerReport, MonitorMsg, WINDOW_SIZE};
+use crate::report::{self, Exported};
+use crate::win::time;
+use crate::win::tray::{Tray, TrayCommand};
+use crate::win::wlan::WifiInfo;
 
 /// 圖表保留的量測次數：300 × 2 秒 = 10 分鐘
 const HISTORY: usize = 300;
 const MAX_EVENTS: usize = 500;
 const GAME_LAYER: usize = 3;
 const FONT_PATH: &str = r"C:\Windows\Fonts\msjh.ttc";
+const REPORT_HOURS: u32 = 24;
+/// 低於這個 Wi-Fi 訊號就用黃色提醒
+const WEAK_WIFI: u32 = 50;
 
-const GREEN: Color32 = Color32::from_rgb(0x3c, 0xb3, 0x71);
-const YELLOW: Color32 = Color32::from_rgb(0xe6, 0xa8, 0x17);
-const RED: Color32 = Color32::from_rgb(0xe0, 0x4b, 0x4b);
-const GRAY: Color32 = Color32::from_rgb(0x88, 0x88, 0x88);
+const GRAY: Color32 = rgb(Health::Unknown);
+const YELLOW: Color32 = rgb(Health::Warn);
+const RED: Color32 = rgb(Health::Bad);
 const LAYER_COLORS: [Color32; 4] = [
     Color32::from_rgb(0x5b, 0x9b, 0xd5),
     Color32::from_rgb(0x9b, 0x7b, 0xd9),
     Color32::from_rgb(0x4d, 0xb6, 0xac),
     Color32::from_rgb(0xf0, 0x8c, 0x3c),
 ];
+
+const fn rgb(health: Health) -> Color32 {
+    let [r, g, b] = health.rgb();
+    Color32::from_rgb(r, g, b)
+}
 
 struct EventEntry {
     /// 給可展開區塊當唯一 ID
@@ -42,11 +55,21 @@ pub struct App {
     status: String,
     game: Option<GameStatus>,
     layers: Vec<LayerReport>,
+    wifi: Option<WifiInfo>,
     /// 每層的 (經過秒數, 延遲)；延遲 None 代表逾時
     history: [VecDeque<(f64, Option<u32>)>; 4],
     /// 最新的在最前面
     events: VecDeque<EventEntry>,
     next_event_id: u64,
+
+    /// 建立系統匣失敗時為 None，此時關閉視窗就直接結束
+    tray: Option<Tray>,
+    tray_rx: Receiver<TrayCommand>,
+    /// 從系統匣選「結束」後才真的關閉，否則按 X 只是縮到系統匣
+    quitting: bool,
+    hide_hint_shown: bool,
+    notify_enabled: bool,
+    export_rx: Option<Receiver<Result<Exported, String>>>,
 }
 
 impl App {
@@ -54,18 +77,34 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         rx: Receiver<MonitorMsg>,
         startup_error: Option<String>,
+        tray: Option<Tray>,
+        tray_rx: Receiver<TrayCommand>,
     ) -> Self {
         let mut app = Self {
             rx,
             status: "啟動中...".into(),
             game: None,
             layers: Vec::new(),
+            wifi: None,
             history: Default::default(),
             events: VecDeque::new(),
             next_event_id: 0,
+            tray,
+            tray_rx,
+            quitting: false,
+            hide_hint_shown: false,
+            notify_enabled: true,
+            export_rx: None,
         };
         if !load_system_font(&cc.egui_ctx) {
             app.push_event(String::new(), format!("找不到中文字型 {FONT_PATH}"), true);
+        }
+        if app.tray.is_none() {
+            app.push_event(
+                String::new(),
+                "無法建立系統匣圖示，關閉視窗就會結束程式".into(),
+                true,
+            );
         }
         if let Some(e) = startup_error {
             app.push_event(String::new(), e, true);
@@ -95,11 +134,17 @@ impl App {
                 MonitorMsg::Status(s) => self.status = s,
                 MonitorMsg::Event { time, text, severe } => self.push_event(time, text, severe),
                 MonitorMsg::Incident(incident) => {
+                    if self.notify_enabled
+                        && let Some(tray) = &self.tray
+                    {
+                        tray.notify(&format!("⚠ {}", incident.title), &incident.diagnosis);
+                    }
                     let (time, text) = (incident.time.clone(), incident.title.clone());
                     self.push_entry(time, text, true, Some(incident));
                 }
                 MonitorMsg::Round {
                     elapsed,
+                    wifi,
                     game,
                     layers,
                 } => {
@@ -115,33 +160,161 @@ impl App {
                     }
                     self.game = Some(game);
                     self.layers = layers;
+                    self.wifi = wifi;
+                    self.update_tray();
                 }
             }
         }
     }
 
-    fn header_ui(&self, ui: &mut egui::Ui) {
+    /// 整體燈號：有遊戲目標時看遊戲伺服器那層，否則看遊戲狀態
+    fn overall_health(&self) -> Health {
+        match &self.game {
+            None | Some(GameStatus::NotRunning) => Health::Unknown,
+            Some(GameStatus::NoConnection) => Health::Warn,
+            Some(GameStatus::Connected(_) | GameStatus::Manual(_)) => self
+                .layers
+                .get(GAME_LAYER)
+                .map_or(Health::Unknown, |r| layer_state(r).0),
+        }
+    }
+
+    fn update_tray(&self) {
+        let Some(tray) = &self.tray else { return };
+        let game = match (&self.game, self.layers.get(GAME_LAYER).and_then(|r| r.last)) {
+            (Some(GameStatus::Connected(_) | GameStatus::Manual(_)), Some(Some(ms))) => {
+                format!("遊戲伺服器 {ms} ms")
+            }
+            (Some(GameStatus::Connected(_) | GameStatus::Manual(_)), _) => "遊戲伺服器 逾時".into(),
+            (Some(GameStatus::NoConnection), _) => "遊戲未連線".into(),
+            _ => "遊戲未執行".into(),
+        };
+        let mut tip = format!("FF14 連線監測\n{game}");
+        if let Some(w) = &self.wifi {
+            tip.push_str(&format!("\nWi-Fi 訊號 {}%", w.quality));
+        }
+        tray.set_status(self.overall_health(), &tip);
+    }
+
+    fn handle_tray_commands(&mut self, ctx: &egui::Context) {
+        while let Ok(cmd) = self.tray_rx.try_recv() {
+            match cmd {
+                TrayCommand::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayCommand::Exit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    /// 按 X 時縮到系統匣，繼續在背景監測
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        let Some(tray) = &self.tray else { return };
+        if self.quitting || !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        if !self.hide_hint_shown {
+            tray.notify(
+                "FF14 連線監測仍在執行",
+                "程式已縮到系統匣，會繼續監測。點圖示可以打開視窗，右鍵選「結束」可以關閉。",
+            );
+            self.hide_hint_shown = true;
+        }
+    }
+
+    fn start_export(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(report::export(REPORT_HOURS));
+            ctx.request_repaint();
+        });
+        self.export_rx = Some(rx);
+    }
+
+    fn poll_export(&mut self) {
+        let Some(rx) = &self.export_rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.export_rx = None;
+        match result {
+            Ok(e) => self.push_event(
+                time::now_hms(),
+                format!(
+                    "已匯出報告：{}（CSV：{}）",
+                    e.html.display(),
+                    e.csv.display()
+                ),
+                false,
+            ),
+            Err(e) => self.push_event(time::now_hms(), format!("匯出失敗：{e}"), true),
+        }
+    }
+
+    fn header_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let (color, text) = match &self.game {
-                None => (GRAY, "遊戲狀態：等待中".to_string()),
-                Some(GameStatus::NotRunning) => (GRAY, "遊戲狀態：未執行".to_string()),
-                Some(GameStatus::NoConnection) => (YELLOW, "遊戲狀態：未連線".to_string()),
-                Some(GameStatus::Connected(t)) => (GREEN, format!("遊戲狀態：已連線　伺服器：{t}")),
-                Some(GameStatus::Manual(t)) => (GREEN, format!("手動目標：{t}")),
+            let text = match &self.game {
+                None => "遊戲狀態：等待中".to_string(),
+                Some(GameStatus::NotRunning) => "遊戲狀態：未執行".to_string(),
+                Some(GameStatus::NoConnection) => "遊戲狀態：未連線".to_string(),
+                Some(GameStatus::Connected(t)) => format!("遊戲狀態：已連線　伺服器：{t}"),
+                Some(GameStatus::Manual(t)) => format!("手動目標：{t}"),
             };
-            // 有目標時，燈號跟著遊戲伺服器那層的實際狀態變色
-            let color = match (color, self.layers.get(GAME_LAYER)) {
-                (GREEN, Some(r)) => layer_state(r).0,
-                _ => color,
-            };
-            ui.label(RichText::new("●").color(color).size(18.0));
+            ui.label(
+                RichText::new("●")
+                    .color(rgb(self.overall_health()))
+                    .size(18.0),
+            );
             ui.label(RichText::new(text).size(16.0));
             if !self.status.is_empty() {
                 ui.separator();
                 ui.spinner();
                 ui.label(&self.status);
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let exporting = self.export_rx.is_some();
+                let label = if exporting {
+                    "匯出中..."
+                } else {
+                    "匯出報告"
+                };
+                if ui
+                    .add_enabled(!exporting, egui::Button::new(label))
+                    .on_hover_text(format!(
+                        "匯出最近 {REPORT_HOURS} 小時的 HTML 報告和 CSV 到「文件\\ff14-netmon」"
+                    ))
+                    .clicked()
+                {
+                    self.start_export(ui.ctx());
+                }
+                if self.tray.is_some() {
+                    ui.checkbox(&mut self.notify_enabled, "異常時通知");
+                }
+            });
         });
+
+        ui.horizontal(|ui| match &self.wifi {
+            Some(w) => {
+                let color = if w.quality < WEAK_WIFI { YELLOW } else { GRAY };
+                ui.label(
+                    RichText::new(format!("Wi-Fi：{}　訊號 {}%", w.ssid, w.quality)).color(color),
+                );
+                if w.quality < WEAK_WIFI {
+                    ui.label(RichText::new("訊號偏弱，建議改用有線網路").color(YELLOW));
+                }
+            }
+            None => {
+                ui.label(RichText::new("網路：有線（未使用 Wi-Fi）").color(GRAY));
+            }
+        });
+
         if let Some(i) = self.latest_incident() {
             ui.label(
                 RichText::new(format!("最近異常 {}：{}　{}", i.time, i.title, i.diagnosis))
@@ -183,8 +356,8 @@ impl App {
                     ui.label(fmt_ms(summary.and_then(|s| s.jitter_ms)));
                     ui.label(summary.map_or("-".to_string(), |s| format!("{:.1}%", s.loss_pct)));
 
-                    let (color, state) = report.map_or((GRAY, "-"), layer_state);
-                    ui.label(RichText::new(format!("● {state}")).color(color));
+                    let (health, state) = report.map_or((Health::Unknown, "-"), layer_state);
+                    ui.label(RichText::new(format!("● {state}")).color(rgb(health)));
                     ui.end_row();
                 }
             });
@@ -251,12 +424,17 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 背景執行緒每送一筆訊息就會要求重繪，不需要持續重繪
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 背景執行緒每送一筆訊息就會要求重繪，不需要持續重繪；視窗隱藏時也會呼叫這裡
         self.drain_messages();
+        self.handle_tray_commands(ctx);
+        self.poll_export();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.handle_close(&ctx);
+
         egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(4.0);
             self.header_ui(ui);
@@ -272,6 +450,12 @@ impl eframe::App for App {
             ui.separator();
             self.chart_ui(ui);
         });
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(tray) = &self.tray {
+            tray.remove();
+        }
     }
 }
 
@@ -291,13 +475,15 @@ fn incident_ui(ui: &mut egui::Ui, id: u64, incident: &Incident) {
 }
 
 /// 狀態燈：最近一次逾時或掉包率 ≥ 5% 為紅，有掉包或抖動大為黃
-fn layer_state(r: &LayerReport) -> (Color32, &'static str) {
+fn layer_state(r: &LayerReport) -> (Health, &'static str) {
     match (r.last, r.summary) {
-        (None, _) => (GRAY, "無目標"),
-        (Some(None), _) => (RED, "逾時"),
-        (_, Some(s)) if s.loss_pct >= 5.0 => (RED, "掉包"),
-        (_, Some(s)) if s.loss_pct > 0.0 || s.jitter_ms.unwrap_or(0.0) > 30.0 => (YELLOW, "不穩"),
-        _ => (GREEN, "正常"),
+        (None, _) => (Health::Unknown, "無目標"),
+        (Some(None), _) => (Health::Bad, "逾時"),
+        (_, Some(s)) if s.loss_pct >= 5.0 => (Health::Bad, "掉包"),
+        (_, Some(s)) if s.loss_pct > 0.0 || s.jitter_ms.unwrap_or(0.0) > 30.0 => {
+            (Health::Warn, "不穩")
+        }
+        _ => (Health::Good, "正常"),
     }
 }
 

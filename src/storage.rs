@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 
+use crate::win::wlan::WifiInfo;
+
 /// 樣本保留天數
 const RETENTION_DAYS: i64 = 30;
 
@@ -48,6 +50,12 @@ impl Storage {
                  rtt_ms INTEGER          -- NULL 代表逾時
              );
              CREATE INDEX IF NOT EXISTS samples_ts ON samples (ts_ms);
+             CREATE TABLE IF NOT EXISTS wifi_samples (
+                 ts_ms   INTEGER NOT NULL,
+                 ssid    TEXT    NOT NULL,
+                 quality INTEGER NOT NULL  -- 訊號品質 0–100
+             );
+             CREATE INDEX IF NOT EXISTS wifi_samples_ts ON wifi_samples (ts_ms);
              CREATE TABLE IF NOT EXISTS incidents (
                  id        INTEGER PRIMARY KEY,
                  ts_ms     INTEGER NOT NULL,
@@ -60,12 +68,19 @@ impl Storage {
         .map_err(|e| e.to_string())?;
 
         let cutoff = now_ms() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
-        conn.execute("DELETE FROM samples WHERE ts_ms < ?1", [cutoff])
-            .map_err(|e| e.to_string())?;
+        for table in ["samples", "wifi_samples"] {
+            conn.execute(&format!("DELETE FROM {table} WHERE ts_ms < ?1"), [cutoff])
+                .map_err(|e| e.to_string())?;
+        }
         Ok(Self { conn })
     }
 
-    pub fn record_round(&mut self, ts_ms: i64, samples: &[Sample]) -> rusqlite::Result<()> {
+    pub fn record_round(
+        &mut self,
+        ts_ms: i64,
+        samples: &[Sample],
+        wifi: Option<&WifiInfo>,
+    ) -> rusqlite::Result<()> {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
@@ -74,6 +89,12 @@ impl Storage {
             for s in samples {
                 stmt.execute(params![ts_ms, s.layer as i64, s.target, s.rtt_ms])?;
             }
+        }
+        if let Some(w) = wifi {
+            tx.execute(
+                "INSERT INTO wifi_samples (ts_ms, ssid, quality) VALUES (?1, ?2, ?3)",
+                params![ts_ms, w.ssid, w.quality],
+            )?;
         }
         tx.commit()
     }

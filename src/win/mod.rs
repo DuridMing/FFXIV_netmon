@@ -3,5 +3,8 @@
 pub mod icmp;
 pub mod process;
 pub mod route;
+pub mod shell;
 pub mod tcp_table;
 pub mod time;
+pub mod tray;
+pub mod wlan;

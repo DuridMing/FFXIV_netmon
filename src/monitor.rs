@@ -13,6 +13,7 @@ use crate::stats::{Summary, Window};
 use crate::storage::{self, Sample, Storage};
 use crate::trace::{self, Trace};
 use crate::win::icmp::{EchoResult, Icmp};
+use crate::win::wlan::{WifiInfo, Wlan};
 use crate::win::{route, time};
 
 pub const INTERVAL: Duration = Duration::from_secs(2);
@@ -48,6 +49,8 @@ pub enum MonitorMsg {
     Round {
         /// 從監測開始經過的秒數，給圖表當 X 軸
         elapsed: f64,
+        /// None 代表沒有連 Wi-Fi（有線網路或沒有無線網卡）
+        wifi: Option<WifiInfo>,
         game: GameStatus,
         layers: Vec<LayerReport>,
     },
@@ -210,6 +213,8 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
     let mut detector = EventDetector::default();
     // 斷線後連線表裡就沒有伺服器了，traceroute 要用最後一次看到的位址
     let mut last_game_target = manual_target;
+    let wlan = Wlan::open();
+    let mut last_wifi: Option<WifiInfo> = None;
     loop {
         let round_start = Instant::now();
 
@@ -251,6 +256,22 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
                 .collect()
         });
 
+        let wifi = wlan.as_ref().and_then(Wlan::current);
+        let wifi_event = match (&last_wifi, &wifi) {
+            (None, Some(w)) => Some((format!("Wi-Fi：{}，訊號 {}%", w.ssid, w.quality), false)),
+            (Some(old), None) => Some((format!("Wi-Fi 連線中斷（{}）", old.ssid), true)),
+            (Some(old), Some(w)) if old.ssid != w.ssid => {
+                Some((format!("Wi-Fi 換成 {}，訊號 {}%", w.ssid, w.quality), false))
+            }
+            _ => None,
+        };
+        if let Some((text, severe)) = wifi_event
+            && !send(event(text, severe))
+        {
+            return;
+        }
+        last_wifi = wifi.clone();
+
         let ts_ms = storage::now_ms();
         let targets: Vec<Option<String>> =
             layers.iter().map(|l| l.probe.map(Probe::target)).collect();
@@ -273,7 +294,7 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
                     })
                 })
                 .collect();
-            if let Err(e) = db.record_round(ts_ms, &samples) {
+            if let Err(e) = db.record_round(ts_ms, &samples, wifi.as_ref()) {
                 send(event(format!("寫入記錄檔失敗，停止存檔：{e}"), true));
                 storage = None;
             }
@@ -285,7 +306,7 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
             if let Some(before) = game_before {
                 states[GAME] = before;
             }
-            let incident = build_incident(kind, &states, &targets, last_game_target);
+            let incident = build_incident(kind, &states, &targets, last_game_target, wifi.as_ref());
             if let Some(db) = &storage {
                 // 事件寫入失敗不影響監測；資料庫真的壞了，下一輪寫樣本時會回報
                 let _ = db.record_incident(
@@ -321,6 +342,7 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
 
         if !send(MonitorMsg::Round {
             elapsed: started.elapsed().as_secs_f64(),
+            wifi,
             game,
             layers: reports,
         }) {
@@ -336,6 +358,7 @@ fn build_incident(
     states: &[LayerState; 4],
     targets: &[Option<String>],
     game_target: Option<SocketAddrV4>,
+    wifi: Option<&WifiInfo>,
 ) -> Incident {
     let involves_game = matches!(
         kind,
@@ -353,6 +376,10 @@ fn build_incident(
         .enumerate()
         .map(|(i, s)| layer_detail(i, s, targets.get(i).cloned().flatten()))
         .collect();
+    details.push(match wifi {
+        Some(w) => format!("Wi-Fi：{}，訊號 {}%", w.ssid, w.quality),
+        None => "Wi-Fi：沒有使用（有線網路）".into(),
+    });
     if let (Some(t), Some(target)) = (&trace, game_target) {
         details.push(format!("traceroute 到 {}：", target.ip()));
         details.extend(trace_lines(t));
@@ -361,7 +388,7 @@ fn build_incident(
     Incident {
         time: time::now_hms(),
         title: kind.title(),
-        diagnosis: diagnosis::diagnose(kind, states, trace.as_ref()),
+        diagnosis: diagnosis::diagnose(kind, states, trace.as_ref(), wifi.map(|w| w.quality)),
         details,
     }
 }
