@@ -20,6 +20,7 @@ pub enum EchoResult {
     /// traceroute 用：封包在中途節點 TTL 歸零
     TtlExpired {
         from: Ipv4Addr,
+        rtt_ms: u32,
     },
     Timeout,
 }
@@ -59,6 +60,7 @@ impl Icmp {
             },
             IP_TTL_EXPIRED_TRANSIT if reply.Address != 0 => EchoResult::TtlExpired {
                 from: Ipv4Addr::from(reply.Address.to_ne_bytes()),
+                rtt_ms: reply.RoundTripTime,
             },
             _ => EchoResult::Timeout,
         }

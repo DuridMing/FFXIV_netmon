@@ -35,12 +35,37 @@ impl Window {
         self.samples.clear();
     }
 
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// 最新一筆樣本；None = 沒有資料，Some(None) = 逾時
+    pub fn last(&self) -> Option<Option<u32>> {
+        self.samples.back().copied()
+    }
+
+    /// 從最新一筆往回數，連續逾時的次數
+    pub fn trailing_losses(&self) -> usize {
+        self.samples
+            .iter()
+            .rev()
+            .take_while(|s| s.is_none())
+            .count()
+    }
+
     pub fn summary(&self) -> Option<Summary> {
-        if self.samples.is_empty() {
+        self.summary_last(self.cap)
+    }
+
+    /// 只統計最近 `n` 筆
+    pub fn summary_last(&self, n: usize) -> Option<Summary> {
+        let skip = self.samples.len().saturating_sub(n);
+        let recent: Vec<Option<u32>> = self.samples.iter().skip(skip).copied().collect();
+        if recent.is_empty() {
             return None;
         }
-        let ok: Vec<f64> = self.samples.iter().flatten().map(|&ms| ms as f64).collect();
-        let lost = self.samples.len() - ok.len();
+        let ok: Vec<f64> = recent.iter().flatten().map(|&ms| ms as f64).collect();
+        let lost = recent.len() - ok.len();
 
         let avg_ms = (!ok.is_empty()).then(|| ok.iter().sum::<f64>() / ok.len() as f64);
         let jitter_ms = (ok.len() >= 2).then(|| {
@@ -49,7 +74,7 @@ impl Window {
         Some(Summary {
             avg_ms,
             jitter_ms,
-            loss_pct: lost as f64 * 100.0 / self.samples.len() as f64,
+            loss_pct: lost as f64 * 100.0 / recent.len() as f64,
         })
     }
 }

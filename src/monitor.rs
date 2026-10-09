@@ -7,7 +7,11 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 
 use crate::detector::{self, GameEvent, GameTracker};
+use crate::diagnosis::{self, LayerState};
+use crate::events::{EventDetector, IncidentKind, RECENT};
 use crate::stats::{Summary, Window};
+use crate::storage::{self, Sample, Storage};
+use crate::trace::{self, Trace};
 use crate::win::icmp::{EchoResult, Icmp};
 use crate::win::{route, time};
 
@@ -16,7 +20,9 @@ const TIMEOUT: Duration = Duration::from_millis(1000);
 const INTERNET_TARGET: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
 /// 統計視窗：30 次 × 2 秒 = 60 秒
 pub const WINDOW_SIZE: usize = 30;
-const MAX_TRACE_HOPS: u8 = 8;
+/// 找 ISP 節點只需要看前幾跳
+const ISP_TRACE_HOPS: u8 = 8;
+const GAME_TRACE_HOPS: u8 = 20;
 
 pub const LAYER_NAMES: [&str; 4] = ["路由器", "ISP", "外部網路", "遊戲伺服器"];
 const GAME: usize = 3;
@@ -50,6 +56,15 @@ pub enum MonitorMsg {
         text: String,
         severe: bool,
     },
+    Incident(Incident),
+}
+
+pub struct Incident {
+    pub time: String,
+    pub title: String,
+    pub diagnosis: String,
+    /// 各層數據與 traceroute，每行一筆
+    pub details: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -98,6 +113,14 @@ impl Layer {
         }
     }
 
+    fn state(&self) -> LayerState {
+        LayerState {
+            has_probe: self.probe.is_some(),
+            last: self.window.last(),
+            recent: self.window.summary_last(RECENT),
+        }
+    }
+
     fn set_probe(&mut self, probe: Option<Probe>) {
         if probe != self.probe {
             self.probe = probe;
@@ -135,6 +158,19 @@ fn event(text: impl Into<String>, severe: bool) -> MonitorMsg {
 }
 
 fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
+    let mut storage = match Storage::open() {
+        Ok(s) => {
+            if let Some(path) = storage::db_path() {
+                send(event(format!("記錄檔：{}", path.display()), false));
+            }
+            Some(s)
+        }
+        Err(e) => {
+            send(event(format!("無法開啟記錄檔，這次不會存檔：{e}"), true));
+            None
+        }
+    };
+
     send(MonitorMsg::Status("尋找路由器...".into()));
     let gateway = route::next_hop(INTERNET_TARGET);
     send(event(
@@ -171,9 +207,15 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
 
     let started = Instant::now();
     let mut tracker = GameTracker::default();
+    let mut detector = EventDetector::default();
+    // 斷線後連線表裡就沒有伺服器了，traceroute 要用最後一次看到的位址
+    let mut last_game_target = manual_target;
     loop {
         let round_start = Instant::now();
 
+        let mut game_disconnected = false;
+        // 斷線時遊戲層的視窗會被清掉，先留下斷線前的狀態給診斷用
+        let mut game_before = None;
         if manual_target.is_none() {
             for ev in tracker.update(&detector::scan()) {
                 let (text, severe) = match ev {
@@ -182,7 +224,9 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
                     GameEvent::Connected(t) => (format!("遊戲伺服器：{t}"), false),
                     GameEvent::TargetChanged(t) => (format!("原連線已結束，改監測 {t}"), false),
                     GameEvent::AllConnectionsLost => {
-                        (format!("遊戲連線全部中斷！{}", loss_brief(&layers)), true)
+                        game_disconnected = true;
+                        game_before = Some(layers[GAME].state());
+                        continue;
                     }
                 };
                 if !send(event(text, severe)) {
@@ -190,6 +234,9 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
                 }
             }
             layers[GAME].set_probe(tracker.target().map(Probe::Tcp));
+            if let Some(t) = tracker.target() {
+                last_game_target = Some(t);
+            }
         }
 
         // 各層同時量測，一輪最多花 TIMEOUT 的時間
@@ -204,18 +251,64 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
                 .collect()
         });
 
+        let ts_ms = storage::now_ms();
+        let targets: Vec<Option<String>> =
+            layers.iter().map(|l| l.probe.map(Probe::target)).collect();
+        for (layer, last) in layers.iter_mut().zip(&results) {
+            if let Some(r) = *last {
+                layer.window.push(r);
+            }
+        }
+
+        if let Some(db) = &mut storage {
+            let samples: Vec<Sample> = targets
+                .iter()
+                .zip(&results)
+                .enumerate()
+                .filter_map(|(i, (target, last))| {
+                    Some(Sample {
+                        layer: i,
+                        target: target.as_deref()?,
+                        rtt_ms: (*last)?,
+                    })
+                })
+                .collect();
+            if let Err(e) = db.record_round(ts_ms, &samples) {
+                send(event(format!("寫入記錄檔失敗，停止存檔：{e}"), true));
+                storage = None;
+            }
+        }
+
+        let windows = [0, 1, 2, 3].map(|i| &layers[i].window);
+        if let Some(kind) = detector.check(windows, game_disconnected) {
+            let mut states = [0, 1, 2, 3].map(|i| layers[i].state());
+            if let Some(before) = game_before {
+                states[GAME] = before;
+            }
+            let incident = build_incident(kind, &states, &targets, last_game_target);
+            if let Some(db) = &storage {
+                // 事件寫入失敗不影響監測；資料庫真的壞了，下一輪寫樣本時會回報
+                let _ = db.record_incident(
+                    ts_ms,
+                    &kind.code(),
+                    &incident.title,
+                    &incident.diagnosis,
+                    &incident.details.join("\n"),
+                );
+            }
+            if !send(MonitorMsg::Incident(incident)) {
+                return;
+            }
+        }
+
         let reports = layers
-            .iter_mut()
+            .iter()
+            .zip(targets)
             .zip(results)
-            .map(|(layer, last)| {
-                if let Some(r) = last {
-                    layer.window.push(r);
-                }
-                LayerReport {
-                    target: layer.probe.map(Probe::target),
-                    last,
-                    summary: layer.window.summary(),
-                }
+            .map(|((layer, target), last)| LayerReport {
+                target,
+                last,
+                summary: layer.window.summary(),
             })
             .collect();
 
@@ -238,41 +331,83 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
     }
 }
 
-/// 斷線事件附帶的簡短數據：各層最近 60 秒的掉包率
-fn loss_brief(layers: &[Layer]) -> String {
-    let parts: Vec<String> = layers
+fn build_incident(
+    kind: IncidentKind,
+    states: &[LayerState; 4],
+    targets: &[Option<String>],
+    game_target: Option<SocketAddrV4>,
+) -> Incident {
+    let involves_game = matches!(
+        kind,
+        IncidentKind::GameDisconnected
+            | IncidentKind::GameUnreachable
+            | IncidentKind::HighLoss(GAME)
+            | IncidentKind::LatencySpike(GAME)
+    );
+    let trace = game_target
+        .filter(|_| involves_game)
+        .map(|t| trace::traceroute(*t.ip(), GAME_TRACE_HOPS));
+
+    let mut details: Vec<String> = states
         .iter()
-        .zip(LAYER_NAMES)
-        .filter_map(|(l, name)| {
-            l.window
-                .summary()
-                .map(|s| format!("{name} {:.0}%", s.loss_pct))
-        })
+        .enumerate()
+        .map(|(i, s)| layer_detail(i, s, targets.get(i).cloned().flatten()))
         .collect();
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!("最近 60 秒掉包：{}", parts.join("、"))
+    if let (Some(t), Some(target)) = (&trace, game_target) {
+        details.push(format!("traceroute 到 {}：", target.ip()));
+        details.extend(trace_lines(t));
     }
+
+    Incident {
+        time: time::now_hms(),
+        title: kind.title(),
+        diagnosis: diagnosis::diagnose(kind, states, trace.as_ref()),
+        details,
+    }
+}
+
+fn layer_detail(i: usize, s: &LayerState, target: Option<String>) -> String {
+    let name = LAYER_NAMES[i];
+    if !s.has_probe && s.recent.is_none() {
+        return format!("{name}：沒有目標");
+    }
+    let target = target.map(|t| format!("（{t}）")).unwrap_or_default();
+    let last = match s.last {
+        Some(Some(ms)) => format!("{ms} ms"),
+        Some(None) => "逾時".into(),
+        None => "-".into(),
+    };
+    match s.recent {
+        Some(r) => format!(
+            "{name}{target}：最近一次 {last}，近 20 秒平均 {}、掉包 {:.0}%",
+            r.avg_ms.map_or("-".into(), |v| format!("{v:.1} ms")),
+            r.loss_pct
+        ),
+        None => format!("{name}{target}：最近一次 {last}"),
+    }
+}
+
+fn trace_lines(t: &Trace) -> Vec<String> {
+    t.hops
+        .iter()
+        .map(|h| match (h.addr, h.rtt_ms) {
+            (Some(a), Some(ms)) => format!("  {:>2}  {a}  {ms} ms", h.ttl),
+            _ => format!("  {:>2}  *", h.ttl),
+        })
+        .collect()
 }
 
 /// traceroute，回傳路由器之後第一個公開 IP 的節點；找不到就退而求其次用第一個私有 IP 節點
 fn find_isp_hop(gateway: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
-    let icmp = Icmp::new().ok()?;
-    let mut fallback = None;
-    for ttl in 1..=MAX_TRACE_HOPS {
-        let hop = match icmp.echo(INTERNET_TARGET, Some(ttl), TIMEOUT) {
-            EchoResult::TtlExpired { from } => from,
-            EchoResult::Reply { .. } => break,
-            EchoResult::Timeout => continue,
-        };
-        if Some(hop) == gateway {
-            continue;
-        }
-        if !hop.is_private() {
-            return Some(hop);
-        }
-        fallback.get_or_insert(hop);
-    }
-    fallback
+    let hops = trace::traceroute(INTERNET_TARGET, ISP_TRACE_HOPS).hops;
+    let candidates: Vec<Ipv4Addr> = hops
+        .iter()
+        .filter_map(|h| h.addr)
+        .filter(|&a| Some(a) != gateway && a != INTERNET_TARGET)
+        .collect();
+    candidates
+        .iter()
+        .find(|a| !a.is_private())
+        .or(candidates.first())
+        .copied()
 }

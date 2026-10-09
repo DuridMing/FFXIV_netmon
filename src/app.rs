@@ -7,11 +7,12 @@ use crossbeam_channel::Receiver;
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
 
-use crate::monitor::{GameStatus, LAYER_NAMES, LayerReport, MonitorMsg, WINDOW_SIZE};
+use crate::monitor::{GameStatus, Incident, LAYER_NAMES, LayerReport, MonitorMsg, WINDOW_SIZE};
 
 /// 圖表保留的量測次數：300 × 2 秒 = 10 分鐘
 const HISTORY: usize = 300;
 const MAX_EVENTS: usize = 500;
+const GAME_LAYER: usize = 3;
 const FONT_PATH: &str = r"C:\Windows\Fonts\msjh.ttc";
 
 const GREEN: Color32 = Color32::from_rgb(0x3c, 0xb3, 0x71);
@@ -26,9 +27,13 @@ const LAYER_COLORS: [Color32; 4] = [
 ];
 
 struct EventEntry {
+    /// 給可展開區塊當唯一 ID
+    id: u64,
     time: String,
     text: String,
     severe: bool,
+    /// 異常事件才有：診斷結論與詳細數據
+    incident: Option<Incident>,
 }
 
 pub struct App {
@@ -41,6 +46,7 @@ pub struct App {
     history: [VecDeque<(f64, Option<u32>)>; 4],
     /// 最新的在最前面
     events: VecDeque<EventEntry>,
+    next_event_id: u64,
 }
 
 impl App {
@@ -56,6 +62,7 @@ impl App {
             layers: Vec::new(),
             history: Default::default(),
             events: VecDeque::new(),
+            next_event_id: 0,
         };
         if !load_system_font(&cc.egui_ctx) {
             app.push_event(String::new(), format!("找不到中文字型 {FONT_PATH}"), true);
@@ -67,7 +74,18 @@ impl App {
     }
 
     fn push_event(&mut self, time: String, text: String, severe: bool) {
-        self.events.push_front(EventEntry { time, text, severe });
+        self.push_entry(time, text, severe, None);
+    }
+
+    fn push_entry(&mut self, time: String, text: String, severe: bool, incident: Option<Incident>) {
+        self.next_event_id += 1;
+        self.events.push_front(EventEntry {
+            id: self.next_event_id,
+            time,
+            text,
+            severe,
+            incident,
+        });
         self.events.truncate(MAX_EVENTS);
     }
 
@@ -76,6 +94,10 @@ impl App {
             match msg {
                 MonitorMsg::Status(s) => self.status = s,
                 MonitorMsg::Event { time, text, severe } => self.push_event(time, text, severe),
+                MonitorMsg::Incident(incident) => {
+                    let (time, text) = (incident.time.clone(), incident.title.clone());
+                    self.push_entry(time, text, true, Some(incident));
+                }
                 MonitorMsg::Round {
                     elapsed,
                     game,
@@ -107,6 +129,11 @@ impl App {
                 Some(GameStatus::Connected(t)) => (GREEN, format!("遊戲狀態：已連線　伺服器：{t}")),
                 Some(GameStatus::Manual(t)) => (GREEN, format!("手動目標：{t}")),
             };
+            // 有目標時，燈號跟著遊戲伺服器那層的實際狀態變色
+            let color = match (color, self.layers.get(GAME_LAYER)) {
+                (GREEN, Some(r)) => layer_state(r).0,
+                _ => color,
+            };
             ui.label(RichText::new("●").color(color).size(18.0));
             ui.label(RichText::new(text).size(16.0));
             if !self.status.is_empty() {
@@ -115,6 +142,12 @@ impl App {
                 ui.label(&self.status);
             }
         });
+        if let Some(i) = self.latest_incident() {
+            ui.label(
+                RichText::new(format!("最近異常 {}：{}　{}", i.time, i.title, i.diagnosis))
+                    .color(YELLOW),
+            );
+        }
     }
 
     fn table_ui(&self, ui: &mut egui::Ui) {
@@ -198,13 +231,22 @@ impl App {
             .auto_shrink(false)
             .show(ui, |ui| {
                 for e in &self.events {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&e.time).monospace().color(GRAY));
-                        let text = RichText::new(&e.text);
-                        ui.label(if e.severe { text.color(RED) } else { text });
-                    });
+                    match &e.incident {
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&e.time).monospace().color(GRAY));
+                                let text = RichText::new(&e.text);
+                                ui.label(if e.severe { text.color(RED) } else { text });
+                            });
+                        }
+                        Some(incident) => incident_ui(ui, e.id, incident),
+                    }
                 }
             });
+    }
+
+    fn latest_incident(&self) -> Option<&Incident> {
+        self.events.iter().find_map(|e| e.incident.as_ref())
     }
 }
 
@@ -231,6 +273,21 @@ impl eframe::App for App {
             self.chart_ui(ui);
         });
     }
+}
+
+/// 異常事件：標題列顯示時間、事件與診斷，展開後看各層數據和 traceroute
+fn incident_ui(ui: &mut egui::Ui, id: u64, incident: &Incident) {
+    let header = format!("{}  ⚠ {}", incident.time, incident.title);
+    egui::CollapsingHeader::new(RichText::new(header).color(RED))
+        .id_salt(("incident", id))
+        .show(ui, |ui| {
+            ui.label(RichText::new(&incident.diagnosis).strong());
+            ui.add_space(4.0);
+            for line in &incident.details {
+                ui.label(RichText::new(line).monospace());
+            }
+        });
+    ui.label(RichText::new(format!("　　{}", incident.diagnosis)).color(GRAY));
 }
 
 /// 狀態燈：最近一次逾時或掉包率 ≥ 5% 為紅，有掉包或抖動大為黃

@@ -8,8 +8,12 @@
 
 mod app;
 mod detector;
+mod diagnosis;
+mod events;
 mod monitor;
 mod stats;
+mod storage;
+mod trace;
 mod win;
 
 use std::net::SocketAddrV4;
