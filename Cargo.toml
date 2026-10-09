@@ -1,0 +1,17 @@
+[package]
+name = "ff14-netmon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-channel = "0.5.17"
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
+egui_plot = "0.37.0"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

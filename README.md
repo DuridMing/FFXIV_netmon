@@ -1,0 +1,86 @@
+# FF14 繁中服連線監測工具（ff14-netmon）
+
+FF14 繁中服常常斷線。這個 Windows 小程式會持續監測連線，在斷線當下判斷問題出在哪一段：自己的網路、ISP，還是遊戲伺服器。
+
+```text
+[你的電腦] → [Wi-Fi/網卡] → [路由器] → [ISP] → [國際路由] → [FF14 繁中服伺服器]
+```
+
+> **目前狀態：M2 基本介面完成**，可以即時監測各層延遲；斷線診斷（M3）開發中。
+
+## 功能（規劃中）
+
+- **自動找出遊戲伺服器**：讀取 `ffxiv_dx11.exe` 的 TCP 連線，不用手動填 IP。
+- **分層監測**：每 1–2 秒量測各層的延遲、抖動和掉包率。
+
+  | 層級 | 目標 | 方法 |
+  | --- | --- | --- |
+  | L1 | 本機網卡、Wi-Fi 訊號 | WLAN API |
+  | L2 | 路由器（預設閘道） | ICMP ping |
+  | L3 | ISP（traceroute 第 2–3 跳） | ICMP ping |
+  | L4 | 外部網路（1.1.1.1 / 8.8.8.8） | ICMP ping |
+  | L5 | 遊戲伺服器 | TCP ping（伺服器常擋 ICMP） |
+
+- **斷線偵測**：以下任一情況算一次斷線，並保存前後 60 秒的數據、自動跑 traceroute：
+  - 遊戲的 TCP 連線消失
+  - L5 連續逾時
+  - 掉包率超過門檻
+- **自動診斷**：
+
+  | 現象 | 判斷 |
+  | --- | --- |
+  | 路由器也掉包 | 家中網路問題 |
+  | 路由器正常、ISP 掉包 | ISP 問題 |
+  | 只有遊戲伺服器掉包 | 伺服器或國際路由問題 |
+  | 全部正常但遊戲斷線 | 伺服器主動斷線或維護 |
+
+- **報告匯出**：匯出 CSV/HTML 報告，可以交給 ISP 或遊戲客服當證據。
+- **其他**：系統匣常駐、斷線通知。
+
+### 安全性
+
+本工具只讀取 Windows 的連線資訊，不讀取、注入或修改遊戲封包，也不碰遊戲程序本身。
+
+## 技術
+
+- 語言：Rust
+- 介面：eframe / egui
+- 圖表：egui_plot
+- 呼叫 Windows API：`windows` crate
+  - `IcmpSendEcho`：ICMP ping，不需要系統管理員權限
+  - `GetExtendedTcpTable`：找出遊戲連線
+- 資料儲存：SQLite（`rusqlite`）
+- 目標大小：單一 exe，約 3–8 MB，不需要另外安裝任何東西
+
+## 開發環境設定
+
+1. 安裝 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)，勾選「使用 C++ 的桌面開發」。Rust 在 Windows 上要用到它的連結器。
+2. 安裝 Rust：
+
+   ```powershell
+   winget install Rustlang.Rustup
+   ```
+
+   也可以從 <https://rustup.rs> 下載 `rustup-init.exe` 安裝。
+3. 重新開啟終端機，確認有裝好：
+
+   ```powershell
+   rustc --version
+   cargo --version
+   ```
+
+## 建置與執行
+
+```powershell
+cargo run                                  # 開啟監測視窗，自動偵測遊戲伺服器
+cargo run -- --target 203.0.113.10:55006   # 手動指定目標（沒開遊戲時測試用）
+cargo build --release                      # 正式版，輸出在 target\release\
+```
+
+## 開發階段
+
+- [x] **M1 命令列原型**：抓出遊戲的伺服器 IP 和連接埠，對各層做 ping，結果印在終端機
+- [x] **M2 基本介面**：狀態表、即時延遲折線圖
+- [ ] **M3 事件與診斷**：斷線偵測、自動 traceroute、診斷結論、SQLite 記錄
+- [ ] **M4 完善**：通知、報告匯出、系統匣
+- [ ] **M5 進階**：TCP 重傳統計（需要系統管理員權限）、長期統計
