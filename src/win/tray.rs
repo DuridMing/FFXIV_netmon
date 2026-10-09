@@ -14,11 +14,12 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, ChangeWindowMessageFilterEx, CreateIcon, CreatePopupMenu, CreateWindowExW,
-    DefWindowProcW, DestroyMenu, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, HICON,
-    MF_STRING, MSG, MSGFLT_ALLOW, PostMessageW, RegisterClassW, RegisterWindowMessageW,
-    SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+    AllowSetForegroundWindow, AppendMenuW, ChangeWindowMessageFilterEx, CreateIcon,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, FindWindowW,
+    GetCursorPos, GetMessageW, GetWindowThreadProcessId, HICON, MF_STRING, MSG, MSGFLT_ALLOW,
+    PostMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
 };
 use windows::core::{PCWSTR, w};
 
@@ -187,6 +188,13 @@ pub fn show_existing() -> bool {
         let Ok(hwnd) = FindWindowW(TRAY_CLASS, TRAY_TITLE) else {
             return false;
         };
+        // 使用者剛點了 exe，前景權限在這個程式手上；不轉給原本的程式的話，
+        // 它的視窗會被 Windows 的前景鎖擋住，只在工作列閃爍，不會跑到最前面
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != 0 {
+            let _ = AllowSetForegroundWindow(pid);
+        }
         PostMessageW(
             Some(hwnd),
             WM_TRAY,

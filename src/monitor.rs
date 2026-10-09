@@ -11,22 +11,21 @@ use crate::diagnosis::{self, LayerState};
 use crate::events::{EventDetector, IncidentKind, RECENT};
 use crate::game_tcp::{GameTcpReport, GameTcpTracker, TcpStatus};
 use crate::hops::{HopReport, HopTracker};
+use crate::network::NetworkWatcher;
 use crate::stats::{Summary, Window};
 use crate::storage::{self, Sample, Storage};
 use crate::trace::{self, Trace};
 use crate::win::elevation;
 use crate::win::icmp::{EchoResult, Icmp};
-use crate::win::netif::{self, NetIf};
+use crate::win::netif::NetIf;
+use crate::win::time;
 use crate::win::wlan::{WifiInfo, Wlan};
-use crate::win::{route, time};
 
 pub const INTERVAL: Duration = Duration::from_secs(2);
 const TIMEOUT: Duration = Duration::from_millis(1000);
-const INTERNET_TARGET: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+pub const INTERNET_TARGET: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
 /// 統計視窗：30 次 × 2 秒 = 60 秒
 pub const WINDOW_SIZE: usize = 30;
-/// 找 ISP 節點只需要看前幾跳
-const ISP_TRACE_HOPS: u8 = 8;
 const GAME_TRACE_HOPS: u8 = 20;
 
 pub const LAYER_NAMES: [&str; 4] = ["路由器", "ISP", "外部網路", "遊戲伺服器"];
@@ -66,7 +65,8 @@ pub enum MonitorMsg {
         hop_loss_origin: Option<(u8, Option<Ipv4Addr>)>,
         /// 目前上網用的網卡；網路中斷時是最後一張用過的網卡
         net_if: Option<NetIf>,
-        network_up: bool,
+        /// 電腦網路斷線的原因；None 代表網路正常
+        network_down: Option<String>,
     },
     Event {
         time: String,
@@ -188,31 +188,28 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
         }
     };
 
-    send(MonitorMsg::Status("尋找路由器...".into()));
-    let mut gateway = route::next_hop(INTERNET_TARGET);
+    send(MonitorMsg::Status(format!(
+        "尋找路由器，並追蹤路由到 {INTERNET_TARGET} 尋找 ISP 節點..."
+    )));
+    let mut network = NetworkWatcher::detect();
     send(event(
-        match gateway {
+        match network.gateway {
             Some(g) => format!("路由器：{g}"),
             None => "找不到預設閘道".into(),
         },
-        gateway.is_none(),
+        network.gateway.is_none(),
     ));
-
-    send(MonitorMsg::Status(format!(
-        "追蹤路由到 {INTERNET_TARGET}，尋找 ISP 節點..."
-    )));
-    let mut isp = find_isp_hop(gateway);
     send(event(
-        match isp {
+        match network.isp {
             Some(h) => format!("ISP 節點：{h}"),
-            None => "找不到 ISP 節點，略過這一層".into(),
+            None => "找不到 ISP 節點，有網路時會每 30 秒重找一次".into(),
         },
         false,
     ));
 
     let mut layers = [
-        Layer::new(gateway.map(Probe::Icmp)),
-        Layer::new(isp.map(Probe::Icmp)),
+        Layer::new(network.gateway.map(Probe::Icmp)),
+        Layer::new(network.isp.map(Probe::Icmp)),
         Layer::new(Some(Probe::Icmp(INTERNET_TARGET))),
         Layer::new(manual_target.map(Probe::Tcp)),
     ];
@@ -232,9 +229,6 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
     let elevated = elevation::is_elevated();
     let mut game_tcp = GameTcpTracker::default();
     let mut hop_tracker = HopTracker::default();
-    // 上一輪用的網卡，網路斷掉時用來查是哪張網卡、為什麼斷
-    let mut last_if: Option<NetIf> = None;
-    let mut network_was_up = true;
     loop {
         let round_start = Instant::now();
 
@@ -290,48 +284,16 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
             _ => None,
         };
 
-        // 網卡狀態：沒有對外路由（網路線拔掉、Wi-Fi 斷線）時，改查上一輪那張網卡，才知道斷線原因
-        let route_if = netif::best_interface(INTERNET_TARGET);
-        let net_if = route_if
-            .and_then(netif::interface)
-            .or_else(|| last_if.as_ref().and_then(|n| netif::interface(n.index)));
-        let network_up = route_if.is_some() && net_if.as_ref().is_some_and(NetIf::connected);
-        let net_event = match (&last_if, &net_if) {
-            (_, Some(n)) if network_up && !network_was_up => {
-                Some((format!("網路連線恢復：{}", n.summary()), false))
-            }
-            (Some(old), Some(n)) if network_up && old.index != n.index => {
-                Some((format!("改用 {} 上網", n.summary()), false))
-            }
-            _ => None,
-        };
-        if let Some((text, severe)) = net_event
-            && !send(event(text, severe))
-        {
-            return;
-        }
-        // 換網卡或換路由器後，重新找路由器和 ISP 節點；不然會一直量舊的目標
-        if network_up {
-            let new_gateway = route::next_hop(INTERNET_TARGET);
-            if new_gateway.is_some() && new_gateway != gateway {
-                gateway = new_gateway;
-                isp = find_isp_hop(gateway);
-                layers[0].set_probe(gateway.map(Probe::Icmp));
-                layers[1].set_probe(isp.map(Probe::Icmp));
-                let text = format!(
-                    "路由器變更為 {}，ISP 節點：{}",
-                    gateway.map_or("-".into(), |g| g.to_string()),
-                    isp.map_or("找不到".into(), |h| h.to_string())
-                );
-                if !send(event(text, false)) {
-                    return;
-                }
+        let net = network.update();
+        for (text, severe) in &net.events {
+            if !send(event(text.clone(), *severe)) {
+                return;
             }
         }
-        if net_if.is_some() {
-            last_if = net_if.clone();
+        if net.targets_changed {
+            layers[0].set_probe(network.gateway.map(Probe::Icmp));
+            layers[1].set_probe(network.isp.map(Probe::Icmp));
         }
-        network_was_up = network_up;
 
         let wifi = wlan.as_ref().and_then(Wlan::current);
         let wifi_event = match (&last_wifi, &wifi) {
@@ -391,14 +353,15 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
         let hop_reports = hop_tracker.reports();
         let hop_loss_origin = hop_tracker.loss_origin();
         if let Some(kind) =
-            detector.check(windows, game_disconnected, network_up, tcp_report.as_ref())
+            detector.check(windows, game_disconnected, net.signal, tcp_report.as_ref())
         {
             let mut states = [0, 1, 2, 3].map(|i| layers[i].state());
             if let Some(before) = game_before {
                 states[GAME] = before;
             }
             let extra = IncidentExtra {
-                net_if: net_if.as_ref(),
+                net_if: net.net_if.as_ref(),
+                network_down: net.down_reason.as_deref(),
                 wifi: wifi.as_ref(),
                 tcp: tcp_report,
                 hops: &hop_reports,
@@ -447,8 +410,8 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
             hop_target: hop_tracker.target(),
             hops: hop_reports,
             hop_loss_origin,
-            net_if,
-            network_up,
+            net_if: net.net_if,
+            network_down: net.down_reason,
         }) {
             return;
         }
@@ -460,6 +423,8 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
 /// 事件發生當下的其他資訊，寫進事件詳情、也給診斷參考
 struct IncidentExtra<'a> {
     net_if: Option<&'a NetIf>,
+    /// 電腦網路斷線的原因；None 代表網路正常
+    network_down: Option<&'a str>,
     wifi: Option<&'a WifiInfo>,
     tcp: Option<GameTcpReport>,
     hops: &'a [HopReport],
@@ -493,16 +458,10 @@ fn build_incident(
         .map(|(i, s)| layer_detail(i, s, targets.get(i).cloned().flatten()))
         .collect();
     if let Some(n) = extra.net_if {
-        let state = if n.connected() {
-            "已連線".to_string()
-        } else {
-            n.down_reason().to_string()
-        };
-        details.push(format!(
-            "網路卡：{}（{}），{state}",
-            n.summary(),
-            n.description
-        ));
+        details.push(format!("網路卡：{}（{}）", n.summary(), n.description));
+    }
+    if let Some(reason) = extra.network_down {
+        details.push(format!("電腦網路：中斷，{reason}"));
     }
     details.push(match wifi {
         Some(w) => format!("Wi-Fi：{}，訊號 {}%", w.ssid, w.quality),
@@ -533,6 +492,7 @@ fn build_incident(
         wifi_quality: wifi.map(|w| w.quality),
         hop_loss_origin: extra.hop_loss_origin,
         net_if: extra.net_if,
+        network_down: extra.network_down,
         retrans_recent: extra.tcp.map(|t| t.retrans_recent),
     };
     Incident {
@@ -589,19 +549,4 @@ fn trace_lines(t: &Trace) -> Vec<String> {
             _ => format!("  {:>2}  *", h.ttl),
         })
         .collect()
-}
-
-/// traceroute，回傳路由器之後第一個公開 IP 的節點；找不到就退而求其次用第一個私有 IP 節點
-fn find_isp_hop(gateway: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
-    let hops = trace::traceroute(INTERNET_TARGET, ISP_TRACE_HOPS).hops;
-    let candidates: Vec<Ipv4Addr> = hops
-        .iter()
-        .filter_map(|h| h.addr)
-        .filter(|&a| Some(a) != gateway && a != INTERNET_TARGET)
-        .collect();
-    candidates
-        .iter()
-        .find(|a| !a.is_private())
-        .or(candidates.first())
-        .copied()
 }

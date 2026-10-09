@@ -2,6 +2,7 @@
 
 use crate::game_tcp::GameTcpReport;
 use crate::monitor::LAYER_NAMES;
+use crate::network::NetworkSignal;
 use crate::stats::Window;
 
 /// 判斷用的近期範圍：10 次 × 2 秒 = 20 秒
@@ -71,22 +72,20 @@ pub struct EventDetector {
     high_loss: [bool; 4],
     spike: [bool; 4],
     retransmitting: bool,
-    /// 上一輪電腦的網路是不是斷的
-    network_down: bool,
     /// 距離上次事件還剩幾輪冷卻
     cooldown: u32,
 }
 
 impl EventDetector {
     /// 每輪量測後呼叫一次。`game_disconnected` 由連線表偵測，不受冷卻限制。
-    /// `network_up` 是電腦本身的網卡有沒有連線；斷線時只回報一次「電腦網路中斷」，
-    /// 斷線期間其他層的異常都是它造成的，不再另外回報。
+    /// `network` 是電腦本身的網路狀態（由 NetworkWatcher 判斷）：剛斷線時回報一次「電腦網路中斷」，
+    /// 斷線期間各層的掉包都是它造成的，不再另外回報；但遊戲斷線仍然要記錄，才不會漏掉斷線次數。
     /// `tcp` 是遊戲連線的 TCP 統計，沒有系統管理員權限時為 None。
     pub fn check(
         &mut self,
         windows: [&Window; 4],
         game_disconnected: bool,
-        network_up: bool,
+        network: NetworkSignal,
         tcp: Option<&GameTcpReport>,
     ) -> Option<IncidentKind> {
         self.cooldown = self.cooldown.saturating_sub(1);
@@ -154,14 +153,12 @@ impl EventDetector {
 
         triggered.extend(lowest_spike.map(IncidentKind::LatencySpike));
 
-        let went_down = !network_up && !self.network_down;
-        self.network_down = !network_up;
-        let kind = if went_down {
+        let kind = if network.went_down {
             Some(IncidentKind::NetworkDown)
-        } else if !network_up {
-            None
         } else if game_disconnected {
             Some(IncidentKind::GameDisconnected)
+        } else if network.down {
+            None
         } else if self.cooldown == 0 {
             triggered.first().copied()
         } else {
@@ -189,7 +186,12 @@ mod tests {
     }
 
     fn check(d: &mut EventDetector, w: &[Window; 4], disconnected: bool) -> Option<IncidentKind> {
-        d.check([&w[0], &w[1], &w[2], &w[3]], disconnected, true, None)
+        d.check(
+            [&w[0], &w[1], &w[2], &w[3]],
+            disconnected,
+            NetworkSignal::default(),
+            None,
+        )
     }
 
     const OK: Option<u32> = Some(10);
@@ -292,18 +294,24 @@ mod tcp_tests {
         let mut d = EventDetector::default();
         let w = healthy();
         let ws = [&w[0], &w[1], &w[2], &w[3]];
-        assert_eq!(d.check(ws, false, true, Some(&report(2, 0))), None);
         assert_eq!(
-            d.check(ws, false, true, Some(&report(6, 0))),
+            d.check(ws, false, NetworkSignal::default(), Some(&report(2, 0))),
+            None
+        );
+        assert_eq!(
+            d.check(ws, false, NetworkSignal::default(), Some(&report(6, 0))),
             Some(IncidentKind::GameRetransmits)
         );
         // 還在重傳就不會重複觸發；降到 1 以下才算恢復
         d.cooldown = 0;
-        assert_eq!(d.check(ws, false, true, Some(&report(3, 0))), None);
-        d.check(ws, false, true, Some(&report(1, 0)));
+        assert_eq!(
+            d.check(ws, false, NetworkSignal::default(), Some(&report(3, 0))),
+            None
+        );
+        d.check(ws, false, NetworkSignal::default(), Some(&report(1, 0)));
         d.cooldown = 0;
         assert_eq!(
-            d.check(ws, false, true, Some(&report(5, 0))),
+            d.check(ws, false, NetworkSignal::default(), Some(&report(5, 0))),
             Some(IncidentKind::GameRetransmits)
         );
     }
@@ -314,7 +322,7 @@ mod tcp_tests {
         let w = healthy();
         let ws = [&w[0], &w[1], &w[2], &w[3]];
         assert_eq!(
-            d.check(ws, false, true, Some(&report(1, 1))),
+            d.check(ws, false, NetworkSignal::default(), Some(&report(1, 1))),
             Some(IncidentKind::GameRtoTimeout)
         );
     }
@@ -325,7 +333,7 @@ mod network_tests {
     use super::*;
 
     #[test]
-    fn network_down_reports_once_and_suppresses_others() {
+    fn network_down_reports_once_and_suppresses_layer_loss() {
         let mut d = EventDetector::default();
         let lossy: [Window; 4] = std::array::from_fn(|_| {
             let mut w = Window::new(30);
@@ -335,13 +343,25 @@ mod network_tests {
             w
         });
         let ws = [&lossy[0], &lossy[1], &lossy[2], &lossy[3]];
+        let went_down = NetworkSignal {
+            down: true,
+            went_down: true,
+        };
+        let still_down = NetworkSignal {
+            down: true,
+            went_down: false,
+        };
         assert_eq!(
-            d.check(ws, false, false, None),
+            d.check(ws, false, went_down, None),
             Some(IncidentKind::NetworkDown)
         );
-        // 斷線期間：各層都在掉包、遊戲也斷了，都不再另外回報
+        // 斷線期間各層都在掉包，不再另外回報
         d.cooldown = 0;
-        assert_eq!(d.check(ws, true, false, None), None);
-        assert_eq!(d.check(ws, false, false, None), None);
+        assert_eq!(d.check(ws, false, still_down, None), None);
+        // 但遊戲斷線一定要記錄，不然報告會少算斷線次數
+        assert_eq!(
+            d.check(ws, true, still_down, None),
+            Some(IncidentKind::GameDisconnected)
+        );
     }
 }

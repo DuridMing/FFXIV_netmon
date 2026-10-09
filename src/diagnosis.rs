@@ -48,6 +48,8 @@ pub struct Context<'a> {
     pub retrans_recent: Option<u32>,
     /// 上網用的網卡；網路中斷時是最後一張用過的網卡
     pub net_if: Option<&'a NetIf>,
+    /// 電腦網路斷線的原因；None 代表網路正常
+    pub network_down: Option<&'a str>,
 }
 
 pub fn diagnose(kind: IncidentKind, layers: &[LayerState; 4], ctx: &Context) -> String {
@@ -66,15 +68,19 @@ pub fn diagnose(kind: IncidentKind, layers: &[LayerState; 4], ctx: &Context) -> 
 }
 
 fn diagnose_network(kind: IncidentKind, layers: &[LayerState; 4], ctx: &Context) -> String {
-    if kind == IncidentKind::NetworkDown {
-        return match ctx.net_if {
-            Some(n) => format!(
-                "電腦本身的網路斷了：{}（{}）。請檢查網路線是否鬆脫、Wi-Fi 是否斷線，或網路卡是否被停用。",
-                n.alias,
-                n.down_reason()
+    if let Some(reason) = ctx.network_down {
+        let card = ctx
+            .net_if
+            .map(|n| format!("{}：", n.alias))
+            .unwrap_or_default();
+        return match kind {
+            IncidentKind::NetworkDown => format!(
+                "電腦本身的網路斷了（{card}{reason}）。請檢查網路線是否鬆脫、Wi-Fi 是否斷線，或網路卡是否被停用。"
             ),
-            None => "電腦本身的網路斷了：找不到可以上網的網路卡。請檢查網路線、Wi-Fi 或網路設定。"
-                .into(),
+            IncidentKind::GameDisconnected => {
+                format!("遊戲在電腦網路中斷期間斷線，是網路中斷造成的（{card}{reason}）。")
+            }
+            _ => format!("電腦網路目前中斷中（{card}{reason}）。"),
         };
     }
     if let IncidentKind::LatencySpike(i) = kind {
@@ -262,5 +268,31 @@ mod tests {
             diagnose(IncidentKind::GameDisconnected, &layers, &Context::default())
                 .starts_with("本機網路正常")
         );
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    fn layers() -> [LayerState; 4] {
+        std::array::from_fn(|_| LayerState {
+            has_probe: true,
+            last: Some(None),
+            recent: None,
+        })
+    }
+
+    #[test]
+    fn network_down_and_game_disconnect_mention_reason() {
+        let ctx = Context {
+            network_down: Some("網路線沒有接上或鬆脫"),
+            ..Default::default()
+        };
+        let down = diagnose(IncidentKind::NetworkDown, &layers(), &ctx);
+        assert!(down.starts_with("電腦本身的網路斷了"));
+        assert!(down.contains("網路線沒有接上或鬆脫"));
+        let game = diagnose(IncidentKind::GameDisconnected, &layers(), &ctx);
+        assert!(game.starts_with("遊戲在電腦網路中斷期間斷線"));
     }
 }

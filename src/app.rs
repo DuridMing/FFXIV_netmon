@@ -30,13 +30,15 @@ const MAX_EVENTS: usize = 500;
 const GAME_LAYER: usize = 3;
 /// 中文字型候選，依序嘗試（都在 Windows 字型資料夾）。
 /// 繁中版 Windows 有微軟正黑體；其他語言版本不一定有，就退而求其次用其他含中文字的字型
-const FONT_CANDIDATES: [(&str, &str); 6] = [
-    ("msjh.ttc", "微軟正黑體"),
-    ("msyh.ttc", "微軟雅黑"),
-    ("mingliu.ttc", "細明體"),
-    ("simsun.ttc", "新宋體"),
-    ("YuGothM.ttc", "Yu Gothic"),
-    ("meiryo.ttc", "Meiryo"),
+/// 第三個欄位：這個字型是否涵蓋大部分繁體中文字（日文字型缺很多繁體字）
+const FONT_CANDIDATES: [(&str, &str, bool); 6] = [
+    ("msjh.ttc", "微軟正黑體", true),
+    ("mingliu.ttc", "細明體", true),
+    ("msyh.ttc", "微軟雅黑", true),
+    // simsun.ttc 的第 0 個字型是「宋體」（新宋體是第 1 個）
+    ("simsun.ttc", "宋體", true),
+    ("YuGothM.ttc", "Yu Gothic", false),
+    ("meiryo.ttc", "Meiryo", false),
 ];
 /// 低於這個 Wi-Fi 訊號就用黃色提醒
 const WEAK_WIFI: u32 = 50;
@@ -81,7 +83,8 @@ pub struct App {
     layers: Vec<LayerReport>,
     wifi: Option<WifiInfo>,
     net_if: Option<NetIf>,
-    network_up: bool,
+    /// 電腦網路斷線的原因；None 代表網路正常
+    network_down: Option<String>,
     tcp: Option<TcpStatus>,
     hop_target: Option<std::net::Ipv4Addr>,
     hops: Vec<HopReport>,
@@ -125,7 +128,7 @@ impl App {
             layers: Vec::new(),
             wifi: None,
             net_if: None,
-            network_up: true,
+            network_down: None,
             tcp: None,
             hop_target: None,
             hops: Vec::new(),
@@ -149,8 +152,13 @@ impl App {
             Some(0) => {}
             Some(i) => app.push_event(
                 String::new(),
-                format!("找不到微軟正黑體，改用{}", FONT_CANDIDATES[i].1),
-                false,
+                match FONT_CANDIDATES[i] {
+                    (_, name, true) => format!("找不到微軟正黑體，改用{name}"),
+                    (_, name, false) => {
+                        format!("找不到繁體中文字型，改用{name}，部分繁體中文字可能會顯示成方框")
+                    }
+                },
+                !FONT_CANDIDATES[i].2,
             ),
             None => app.push_event(
                 String::new(),
@@ -211,10 +219,10 @@ impl App {
                     hops,
                     hop_loss_origin,
                     net_if,
-                    network_up,
+                    network_down,
                 } => {
                     self.net_if = net_if;
-                    self.network_up = network_up;
+                    self.network_down = network_down;
                     self.tcp = Some(tcp);
                     self.hop_target = hop_target;
                     self.hops = hops;
@@ -488,21 +496,20 @@ impl App {
         });
 
         ui.horizontal_wrapped(|ui| {
-            match (&self.net_if, self.network_up) {
-                (Some(n), true) => {
+            match (&self.net_if, &self.network_down) {
+                (Some(n), None) => {
                     ui.label(RichText::new(format!("網路：{}", n.summary())).color(GRAY))
                         .on_hover_text(&n.description);
                 }
-                (Some(n), false) => {
+                (Some(n), Some(reason)) => {
                     ui.label(
-                        RichText::new(format!("網路中斷：{}（{}）", n.alias, n.down_reason()))
-                            .color(RED),
+                        RichText::new(format!("網路中斷：{}（{reason}）", n.alias)).color(RED),
                     );
                 }
-                (None, false) => {
-                    ui.label(RichText::new("網路中斷：找不到可以上網的網路卡").color(RED));
+                (None, Some(reason)) => {
+                    ui.label(RichText::new(format!("網路中斷：{reason}")).color(RED));
                 }
-                (None, true) => {}
+                (None, None) => {}
             }
             if let Some(w) = &self.wifi {
                 let color = if w.quality < WEAK_WIFI { YELLOW } else { GRAY };
@@ -928,7 +935,7 @@ fn load_system_font(ctx: &egui::Context) -> Option<usize> {
     let (index, bytes) = FONT_CANDIDATES
         .iter()
         .enumerate()
-        .find_map(|(i, (file, _))| std::fs::read(fonts_dir.join(file)).ok().map(|b| (i, b)))?;
+        .find_map(|(i, (file, _, _))| std::fs::read(fonts_dir.join(file)).ok().map(|b| (i, b)))?;
     let mut fonts = egui::FontDefinitions::default();
     fonts
         .font_data

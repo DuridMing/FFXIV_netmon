@@ -19,6 +19,7 @@ mod game_tcp;
 mod hops;
 mod icon;
 mod monitor;
+mod network;
 mod report;
 mod settings;
 mod stats;
@@ -28,6 +29,7 @@ mod win;
 
 use std::net::SocketAddrV4;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui;
 
@@ -40,6 +42,10 @@ pub const APP_NAME: &str = "FF14 連線監測";
 const APP_ICON_SIZE: u32 = 64;
 /// 重新啟動時，等舊的程式結束最多等多久
 const RESTART_WAIT_MS: u32 = 15_000;
+
+/// 畫面已經初始化成功（eframe 建好繪圖裝置後才會呼叫 app creator）。
+/// 之後 run_native 回傳錯誤就不是「這種繪圖方式不能用」，而是執行中發生的錯誤
+static GRAPHICS_READY: AtomicBool = AtomicBool::new(false);
 
 /// 繪圖方式。DirectX 12 用省電顯示卡最不影響遊戲；失敗時依序改用 OpenGL、軟體繪圖
 #[derive(Clone, Copy, PartialEq)]
@@ -150,7 +156,16 @@ fn main() {
     };
 
     let Err(err) = run(&opts) else { return };
-    // 繪圖初始化失敗：winit 一個程式只能建立一次事件迴圈，所以用下一種繪圖方式重新啟動自己
+    // winit 一個程式只能建立一次事件迴圈，不管哪種情況都要重新啟動自己
+    if GRAPHICS_READY.load(Ordering::SeqCst) {
+        // 畫面原本好好的，執行中才出錯（例如顯示卡驅動重置）：用同一種繪圖方式重開，繼續監測
+        drop(lock);
+        if let Err(e) = relaunch(&opts, opts.renderer) {
+            show_fatal(&format!("{err}\n無法重新啟動：{e}"));
+        }
+        return;
+    }
+    // 繪圖初始化失敗：改用下一種繪圖方式
     match opts.renderer.next() {
         Some(next) => {
             drop(lock);
@@ -211,6 +226,7 @@ fn run(opts: &Options) -> eframe::Result {
         &format!("{APP_NAME} v{VERSION}"),
         options,
         Box::new(move |cc| {
+            GRAPHICS_READY.store(true, Ordering::SeqCst);
             let ctx = cc.egui_ctx.clone();
             let rx = monitor::spawn(target, move || ctx.request_repaint());
 

@@ -1,10 +1,8 @@
-//! 網路卡狀態（GetBestInterface + GetIfEntry2）：目前用哪張網卡上網、有沒有連線、速度多少。
-
-use std::net::Ipv4Addr;
+//! 網路卡狀態（GetIfEntry2）：目前用哪張網卡上網、有沒有連線、速度多少。
 
 use windows::Win32::Foundation::NO_ERROR;
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetBestInterface, GetIfEntry2, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, MIB_IF_ROW2,
+    GetIfEntry2, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, MIB_IF_ROW2,
 };
 use windows::Win32::NetworkManagement::Ndis::{
     IfOperStatusUp, MediaConnectStateConnected, NET_IF_ADMIN_STATUS_UP,
@@ -65,13 +63,6 @@ impl NetIf {
     }
 }
 
-/// 連到 `dest` 時會走哪張網卡；沒有路由（例如網路線拔掉）時回傳 None
-pub fn best_interface(dest: Ipv4Addr) -> Option<u32> {
-    let mut index = 0u32;
-    let ret = unsafe { GetBestInterface(u32::from_ne_bytes(dest.octets()), &mut index) };
-    (ret == NO_ERROR.0).then_some(index)
-}
-
 pub fn interface(index: u32) -> Option<NetIf> {
     let mut row = MIB_IF_ROW2 {
         InterfaceIndex: index,
@@ -108,7 +99,9 @@ mod tests {
     #[test]
     #[ignore]
     fn print_current_interface() {
-        let index = best_interface(Ipv4Addr::new(1, 1, 1, 1)).expect("沒有對外路由");
+        let index = crate::win::route::best_route(std::net::Ipv4Addr::new(1, 1, 1, 1))
+            .expect("沒有對外路由")
+            .if_index;
         let nif = interface(index).expect("讀不到網卡");
         println!("{nif:?}");
         println!("summary: {}, connected: {}", nif.summary(), nif.connected());
