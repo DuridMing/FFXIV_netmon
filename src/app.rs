@@ -6,11 +6,13 @@ use std::thread;
 
 use crossbeam_channel::Receiver;
 use eframe::egui::{self, Color32, RichText};
-use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
+use egui_plot::{Legend, Line, Plot, PlotPoints, Points, VLine};
 
 use crate::icon::Health;
 use crate::monitor::{GameStatus, Incident, LAYER_NAMES, LayerReport, MonitorMsg, WINDOW_SIZE};
 use crate::report::{self, Exported};
+use crate::settings::{CloseAction, Settings};
+use crate::storage;
 use crate::win::time;
 use crate::win::tray::{Tray, TrayCommand};
 use crate::win::wlan::WifiInfo;
@@ -58,6 +60,8 @@ pub struct App {
     wifi: Option<WifiInfo>,
     /// 每層的 (經過秒數, 延遲)；延遲 None 代表逾時
     history: [VecDeque<(f64, Option<u32>)>; 4],
+    /// 每一輪的 (經過秒數, 量測時間)，給圖表的滑鼠提示用
+    round_times: VecDeque<(f64, String)>,
     /// 最新的在最前面
     events: VecDeque<EventEntry>,
     next_event_id: u64,
@@ -65,11 +69,14 @@ pub struct App {
     /// 建立系統匣失敗時為 None，此時關閉視窗就直接結束
     tray: Option<Tray>,
     tray_rx: Receiver<TrayCommand>,
-    /// 從系統匣選「結束」後才真的關閉，否則按 X 只是縮到系統匣
+    /// 從系統匣選「結束」後才真的關閉；設定成縮到系統匣時，按 X 只會隱藏視窗
     quitting: bool,
     hide_hint_shown: bool,
-    notify_enabled: bool,
+    settings: Settings,
     export_rx: Option<Receiver<Result<Exported, String>>>,
+    /// 正在顯示「確定要清除紀錄嗎」對話框
+    confirm_clear: bool,
+    clear_rx: Option<Receiver<Result<(), String>>>,
 }
 
 impl App {
@@ -87,14 +94,17 @@ impl App {
             layers: Vec::new(),
             wifi: None,
             history: Default::default(),
+            round_times: VecDeque::new(),
             events: VecDeque::new(),
             next_event_id: 0,
             tray,
             tray_rx,
             quitting: false,
             hide_hint_shown: false,
-            notify_enabled: true,
+            settings: Settings::load(),
             export_rx: None,
+            confirm_clear: false,
+            clear_rx: None,
         };
         if !load_system_font(&cc.egui_ctx) {
             app.push_event(String::new(), format!("找不到中文字型 {FONT_PATH}"), true);
@@ -134,7 +144,7 @@ impl App {
                 MonitorMsg::Status(s) => self.status = s,
                 MonitorMsg::Event { time, text, severe } => self.push_event(time, text, severe),
                 MonitorMsg::Incident(incident) => {
-                    if self.notify_enabled
+                    if self.settings.notify
                         && let Some(tray) = &self.tray
                     {
                         tray.notify(&format!("⚠ {}", incident.title), &incident.diagnosis);
@@ -157,6 +167,10 @@ impl App {
                         if history.len() > HISTORY {
                             history.pop_front();
                         }
+                    }
+                    self.round_times.push_back((elapsed, time::now_hms()));
+                    if self.round_times.len() > HISTORY {
+                        self.round_times.pop_front();
                     }
                     self.game = Some(game);
                     self.layers = layers;
@@ -212,10 +226,13 @@ impl App {
         }
     }
 
-    /// 按 X 時縮到系統匣，繼續在背景監測
+    /// 設定成縮到系統匣時，按 X 只隱藏視窗，繼續在背景監測；否則照常結束
     fn handle_close(&mut self, ctx: &egui::Context) {
         let Some(tray) = &self.tray else { return };
-        if self.quitting || !ctx.input(|i| i.viewport().close_requested()) {
+        if self.quitting
+            || self.settings.close_action == CloseAction::Exit
+            || !ctx.input(|i| i.viewport().close_requested())
+        {
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -223,7 +240,7 @@ impl App {
         if !self.hide_hint_shown {
             tray.notify(
                 "FF14 連線監測仍在執行",
-                "程式已縮到系統匣，會繼續監測。點圖示可以打開視窗，右鍵選「結束」可以關閉。",
+                "程式已縮到系統匣，會繼續監測。點圖示可以打開視窗，右鍵選「結束」可以關閉。也可以在「設定」改成按 X 直接結束。",
             );
             self.hide_hint_shown = true;
         }
@@ -254,6 +271,111 @@ impl App {
                 false,
             ),
             Err(e) => self.push_event(time::now_hms(), format!("匯出失敗：{e}"), true),
+        }
+    }
+
+    fn start_clear(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(storage::clear_all());
+            ctx.request_repaint();
+        });
+        self.clear_rx = Some(rx);
+    }
+
+    fn poll_clear(&mut self) {
+        let Some(rx) = &self.clear_rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.clear_rx = None;
+        match result {
+            Ok(()) => {
+                self.events.clear();
+                self.push_event(time::now_hms(), "已清除所有紀錄".into(), false);
+            }
+            Err(e) => self.push_event(time::now_hms(), format!("清除紀錄失敗：{e}"), true),
+        }
+    }
+
+    fn save_settings(&mut self) {
+        if let Err(e) = self.settings.save() {
+            self.push_event(time::now_hms(), format!("無法儲存設定：{e}"), true);
+        }
+    }
+
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        let before = self.settings;
+
+        ui.label(RichText::new("按視窗的 X 時").strong());
+        ui.add_enabled_ui(self.tray.is_some(), |ui| {
+            ui.radio_value(
+                &mut self.settings.close_action,
+                CloseAction::MinimizeToTray,
+                "縮到系統匣，繼續監測",
+            );
+        });
+        ui.radio_value(
+            &mut self.settings.close_action,
+            CloseAction::Exit,
+            "直接結束程式",
+        );
+        ui.separator();
+
+        ui.add_enabled_ui(self.tray.is_some(), |ui| {
+            ui.checkbox(&mut self.settings.notify, "發生異常時跳出通知");
+        });
+        ui.separator();
+
+        let clearing = self.clear_rx.is_some();
+        let label = if clearing {
+            "清除中..."
+        } else {
+            "清除所有紀錄..."
+        };
+        if ui
+            .add_enabled(
+                !clearing,
+                egui::Button::new(RichText::new(label).color(RED)),
+            )
+            .clicked()
+        {
+            self.confirm_clear = true;
+            ui.close();
+        }
+
+        if self.settings != before {
+            self.save_settings();
+        }
+    }
+
+    fn confirm_clear_ui(&mut self, ctx: &egui::Context) {
+        if !self.confirm_clear {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::new("confirm_clear")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("清除所有紀錄？");
+            ui.add_space(6.0);
+            ui.label(
+                "會刪除記錄檔裡所有的量測數據、Wi-Fi 紀錄和異常事件，畫面上的事件列表也會清空。",
+            );
+            ui.label(
+                RichText::new("刪除後無法復原。如果之後可能需要當作證據，請先匯出報告。")
+                    .color(YELLOW),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("清除").color(RED)).clicked() {
+                    self.start_clear(ui.ctx());
+                    self.confirm_clear = false;
+                }
+                if ui.button("取消").clicked() {
+                    self.confirm_clear = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            self.confirm_clear = false;
         }
     }
 
@@ -294,9 +416,7 @@ impl App {
                 {
                     self.start_export(ui.ctx());
                 }
-                if self.tray.is_some() {
-                    ui.checkbox(&mut self.notify_enabled, "異常時通知");
-                }
+                ui.menu_button("設定", |ui| self.settings_menu(ui));
             });
         });
 
@@ -372,7 +492,7 @@ impl App {
             .map(|&(x, _)| [x, 0.0])
             .collect();
 
-        Plot::new("latency")
+        let response = Plot::new("latency")
             .legend(Legend::default())
             .include_y(0.0)
             .allow_drag(false)
@@ -384,6 +504,9 @@ impl App {
                 let s = mark.value.max(0.0) as u64;
                 format!("{}:{:02}", s / 60, s % 60)
             })
+            // 預設的座標提示沒有意義（X 軸是經過秒數），改用下面的數值提示
+            .show_x(false)
+            .show_y(false)
             .show(ui, |plot| {
                 for (i, history) in self.history.iter().enumerate() {
                     let points: PlotPoints = history
@@ -395,7 +518,59 @@ impl App {
                 if !lost.is_empty() {
                     plot.points(Points::new("掉包", lost).color(RED).radius(3.5));
                 }
+
+                // 滑鼠所在位置最近的一輪：畫一條垂直線，並標出各層在那一輪的數值
+                let hovered = plot
+                    .pointer_coordinate()
+                    .and_then(|p| self.nearest_round(p.x));
+                if let Some((x, _)) = hovered {
+                    // 名稱留空，才不會出現在圖例裡
+                    plot.vline(VLine::new("", x).color(GRAY));
+                    for (i, history) in self.history.iter().enumerate() {
+                        if let Some(Some(ms)) = value_at(history, x) {
+                            plot.points(
+                                Points::new("", vec![[x, ms as f64]])
+                                    .color(LAYER_COLORS[i])
+                                    .radius(4.5),
+                            );
+                        }
+                    }
+                }
+                hovered
             });
+
+        if let Some((x, time)) = response.inner {
+            response.response.on_hover_ui_at_pointer(|ui| {
+                ui.label(RichText::new(time).strong());
+                egui::Grid::new("chart_hover")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        for (i, history) in self.history.iter().enumerate() {
+                            let value = match value_at(history, x) {
+                                Some(Some(ms)) => format!("{ms} ms"),
+                                Some(None) => "逾時".into(),
+                                None => continue,
+                            };
+                            ui.label(RichText::new(LAYER_NAMES[i]).color(LAYER_COLORS[i]));
+                            let text = RichText::new(value);
+                            ui.label(if value_at(history, x) == Some(None) {
+                                text.color(RED)
+                            } else {
+                                text
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
+        }
+    }
+
+    /// 找出 X 座標最接近 `x` 的那一輪，回傳 (該輪的 X, 量測時間)
+    fn nearest_round(&self, x: f64) -> Option<(f64, String)> {
+        self.round_times
+            .iter()
+            .min_by(|a, b| (a.0 - x).abs().total_cmp(&(b.0 - x).abs()))
+            .cloned()
     }
 
     fn events_ui(&self, ui: &mut egui::Ui) {
@@ -429,11 +604,13 @@ impl eframe::App for App {
         self.drain_messages();
         self.handle_tray_commands(ctx);
         self.poll_export();
+        self.poll_clear();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_close(&ctx);
+        self.confirm_clear_ui(&ctx);
 
         egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(4.0);
@@ -452,11 +629,16 @@ impl eframe::App for App {
         });
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         if let Some(tray) = &self.tray {
             tray.remove();
         }
     }
+}
+
+/// 某一層在 X 座標 `x` 那一輪的結果；None = 那一輪沒有這層的資料，Some(None) = 逾時
+fn value_at(history: &VecDeque<(f64, Option<u32>)>, x: f64) -> Option<Option<u32>> {
+    history.iter().find(|(hx, _)| *hx == x).map(|&(_, ms)| ms)
 }
 
 /// 異常事件：標題列顯示時間、事件與診斷，展開後看各層數據和 traceroute

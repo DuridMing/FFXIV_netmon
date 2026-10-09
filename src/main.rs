@@ -13,6 +13,7 @@ mod events;
 mod icon;
 mod monitor;
 mod report;
+mod settings;
 mod stats;
 mod storage;
 mod trace;
@@ -43,7 +44,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([780.0, 680.0])
             .with_min_inner_size([560.0, 460.0])
-            .with_icon(Arc::new(icon)),
+            .with_icon(Arc::new(icon))
+            // 啟動時不搶焦點，避免正在玩的遊戲失去焦點
+            .with_active(false),
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: low_power_wgpu(),
         ..Default::default()
     };
     eframe::run_native(
@@ -69,6 +74,20 @@ fn main() -> eframe::Result {
             )))
         }),
     )
+}
+
+/// 只用 DirectX 12，並優先選省電的顯示卡（有內顯就用內顯）。
+/// 用 OpenGL 會跟遊戲搶同一張獨立顯示卡，開程式的瞬間遊戲會卡一下。
+fn low_power_wgpu() -> eframe::WgpuConfiguration {
+    use eframe::egui_wgpu::WgpuSetup;
+    use eframe::wgpu;
+
+    let mut config = eframe::WgpuConfiguration::default();
+    if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
+        setup.instance_descriptor.backends = wgpu::Backends::DX12;
+        setup.power_preference = wgpu::PowerPreference::LowPower;
+    }
+    config
 }
 
 fn parse_target_arg() -> Result<Option<SocketAddrV4>, String> {
