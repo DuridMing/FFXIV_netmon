@@ -2,11 +2,9 @@
 
 use std::net::Ipv4Addr;
 use std::thread;
-use std::time::Duration;
 
+use crate::monitor::PROBE_TIMEOUT;
 use crate::win::icmp::{EchoResult, Icmp};
-
-const TIMEOUT: Duration = Duration::from_millis(1000);
 
 pub struct Hop {
     pub ttl: u8,
@@ -33,7 +31,7 @@ pub fn traceroute(dest: Ipv4Addr, max_hops: u8) -> Trace {
         let handles: Vec<_> = (1..=max_hops)
             .map(|ttl| {
                 s.spawn(move || match Icmp::new() {
-                    Ok(icmp) => icmp.echo(dest, Some(ttl), TIMEOUT),
+                    Ok(icmp) => icmp.echo(dest, Some(ttl), PROBE_TIMEOUT),
                     Err(_) => EchoResult::Timeout,
                 })
             })

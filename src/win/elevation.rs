@@ -31,28 +31,13 @@ pub fn is_elevated() -> bool {
     }
 }
 
-/// 用系統管理員身分重新執行自己（會跳出 UAC 視窗），參數照原樣帶過去。
-/// `extra` 是要另外加上的 (參數, 值)，原本就有同名參數時會取代掉。
+/// 用系統管理員身分、以 `args` 為參數重新執行自己（會跳出 UAC 視窗）。
 /// 使用者在 UAC 按「否」時回傳 false，呼叫端應該繼續執行原本的程式。
-pub fn restart_as_admin(extra: &[(&str, String)]) -> bool {
+pub fn restart_as_admin(args: &[String]) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    let mut args = Vec::new();
-    let mut iter = std::env::args().skip(1);
-    while let Some(a) = iter.next() {
-        if extra.iter().any(|(flag, _)| *flag == a) {
-            iter.next();
-        } else if a != "--restarted" {
-            args.push(quote(&a));
-        }
-    }
-    for (flag, value) in extra {
-        args.push(flag.to_string());
-        args.push(quote(value));
-    }
-    // 加上 --restarted：新的程式會等這個結束後才開始，不會被當成重複開啟
-    args.push("--restarted".into());
+    let args: Vec<String> = args.iter().map(|a| quote(a)).collect();
     let exe = HSTRING::from(exe.as_os_str());
     let args = HSTRING::from(args.join(" "));
     // ShellExecute 成功時回傳值大於 32

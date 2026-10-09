@@ -13,6 +13,9 @@ use crate::wifi::WifiInfo;
 
 /// 樣本保留天數
 const RETENTION_DAYS: i64 = 30;
+/// 有時間戳記的量測資料表：超過保留天數會刪掉，「清除所有紀錄」也會清空（另外再加上 incidents）。
+/// 新增資料表時要加在這裡
+const SAMPLE_TABLES: [&str; 4] = ["samples", "wifi_samples", "tcp_stats", "hop_stats"];
 /// 另一個連線（例如清除紀錄）正在寫入時，最多等這麼久，不要直接回報失敗
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -80,16 +83,13 @@ pub fn clear_all() -> Result<(), String> {
 fn clear_db(path: &std::path::Path) -> Result<(), String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| e.to_string())?;
-    conn.execute_batch(
-        "BEGIN;
-         DELETE FROM samples;
-         DELETE FROM tcp_stats;
-         DELETE FROM hop_stats;
-         DELETE FROM wifi_samples;
-         DELETE FROM incidents;
-         COMMIT;",
-    )
-    .map_err(|e| e.to_string())?;
+    let deletes: String = SAMPLE_TABLES
+        .iter()
+        .chain(&["incidents"])
+        .map(|t| format!("DELETE FROM {t};"))
+        .collect();
+    conn.execute_batch(&format!("BEGIN; {deletes} COMMIT;"))
+        .map_err(|e| e.to_string())?;
     // 壓縮失敗不影響結果（資料已經刪掉了），只是檔案暫時不會變小
     let _ = conn.execute_batch("VACUUM;");
     Ok(())
@@ -166,7 +166,7 @@ impl Storage {
     /// 刪掉超過保留天數的樣本（事件不刪）
     pub fn prune(&self) -> rusqlite::Result<()> {
         let cutoff = now_ms() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
-        for table in ["samples", "wifi_samples", "tcp_stats", "hop_stats"] {
+        for table in SAMPLE_TABLES {
             self.conn
                 .execute(&format!("DELETE FROM {table} WHERE ts_ms < ?1"), [cutoff])?;
         }
@@ -288,6 +288,32 @@ mod tests {
         s.prune().unwrap();
         assert_eq!(count("samples"), 2);
         assert_eq!(count("wifi_samples"), 2);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_empties_every_table() {
+        let dir = std::env::temp_dir().join(format!("ff14-netmon-clear-{}", std::process::id()));
+        let path = dir.join("clear.db");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Storage::open_at(&path).unwrap();
+        let mut r = round(now_ms());
+        r.incident = Some(IncidentRecord {
+            kind: "x".into(),
+            title: "x".into(),
+            diagnosis: "x".into(),
+            details: "x".into(),
+        });
+        s.write_rounds(&[r]).unwrap();
+        clear_db(&path).unwrap();
+        for table in SAMPLE_TABLES.iter().chain(&["incidents"]) {
+            let n: i64 = s
+                .conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table}");
+        }
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }

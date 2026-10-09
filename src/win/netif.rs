@@ -9,6 +9,8 @@ use windows::Win32::NetworkManagement::Ndis::{
     IfOperStatusUp, MediaConnectStateDisconnected, NET_IF_ADMIN_STATUS_UP,
 };
 
+use super::wide_to_string;
+
 /// MIB_IF_ROW2.InterfaceAndOperStatusFlags 的位元：有實體接頭（實體網卡才有）
 const CONNECTOR_PRESENT: u8 = 1 << 2;
 
@@ -104,15 +106,11 @@ pub fn physical_interfaces() -> Vec<NetIf> {
 }
 
 fn from_row(row: &MIB_IF_ROW2) -> NetIf {
-    let text = |s: &[u16]| {
-        let len = s.iter().position(|&c| c == 0).unwrap_or(s.len());
-        String::from_utf16_lossy(&s[..len])
-    };
     NetIf {
         index: row.InterfaceIndex,
         guid: row.InterfaceGuid.to_u128(),
-        alias: text(&row.Alias),
-        description: text(&row.Description),
+        alias: wide_to_string(&row.Alias),
+        description: wide_to_string(&row.Description),
         kind: match row.Type {
             IF_TYPE_ETHERNET_CSMACD => IfKind::Ethernet,
             IF_TYPE_IEEE80211 => IfKind::Wifi,

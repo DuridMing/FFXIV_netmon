@@ -3,11 +3,9 @@
 use std::collections::VecDeque;
 
 use crate::events::RECENT;
+use crate::monitor::WINDOW_SIZE;
 use crate::win::estats::{self, ERROR_ACCESS_DENIED, PathStats};
 use crate::win::tcp_table::TcpConn;
-
-/// 統計視窗：30 次 × 2 秒 = 60 秒
-const WINDOW_SIZE: usize = 30;
 
 #[derive(Clone, Copy)]
 pub struct GameTcpReport {
@@ -17,12 +15,12 @@ pub struct GameTcpReport {
     /// 這一輪新增的重傳封包數與 RTO 逾時次數
     pub retrans: u32,
     pub timeouts: u32,
-    /// 近 20 秒（RECENT 輪）的合計
+    /// 近期（RECENT 輪）的合計
     pub retrans_recent: u32,
     pub timeouts_recent: u32,
-    /// 近 60 秒的合計
-    pub retrans_60s: u32,
-    pub timeouts_60s: u32,
+    /// 整個統計視窗（WINDOW_SIZE 輪）的合計
+    pub retrans_window: u32,
+    pub timeouts_window: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -99,7 +97,7 @@ impl GameTcpTracker {
                 .fold((0, 0), |(r, t), &(dr, dt)| (r + dr, t + dt))
         };
         let (retrans_recent, timeouts_recent) = sum(RECENT);
-        let (retrans_60s, timeouts_60s) = sum(WINDOW_SIZE);
+        let (retrans_window, timeouts_window) = sum(WINDOW_SIZE);
         TcpStatus::Stats(GameTcpReport {
             smoothed_rtt_ms: stats.smoothed_rtt_ms,
             rtt_var_ms: stats.rtt_var_ms,
@@ -107,8 +105,8 @@ impl GameTcpTracker {
             timeouts,
             retrans_recent,
             timeouts_recent,
-            retrans_60s,
-            timeouts_60s,
+            retrans_window,
+            timeouts_window,
         })
     }
 }

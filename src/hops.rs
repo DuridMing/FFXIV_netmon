@@ -5,18 +5,17 @@
 
 use std::net::Ipv4Addr;
 
+use crate::monitor::WINDOW_SIZE;
 use crate::stats::{Summary, Window};
 use crate::trace::Trace;
 
-/// 統計視窗：30 次 × 2 秒 = 60 秒
-const WINDOW_SIZE: usize = 30;
 /// 近期掉包率超過這個值才算這一跳在掉包
 const LOSS_PCT: f64 = 20.0;
 /// 判斷掉包起點時，至少要有這麼多筆樣本
 const MIN_SAMPLES: usize = 10;
 /// 每幾輪彙總一次寫進記錄檔（30 × 2 秒 = 1 分鐘）
 pub const AGGREGATE_ROUNDS: u32 = 30;
-/// 第一次追蹤時最多看幾跳
+/// 第一次追蹤時最多看幾跳（事件發生時的 traceroute 也用這個）
 pub const MAX_HOPS: u8 = 20;
 /// 目標本身連得上，但路徑最後幾跳連續這麼多輪沒有回應，就當作路徑變短、那幾跳已經不在路徑上
 const STALE_ROUNDS: u32 = 5;

@@ -1,14 +1,17 @@
 //! 異常事件偵測：根據各層的量測視窗判斷何時該記錄一次事件。
 
 use crate::game_tcp::GameTcpReport;
-use crate::monitor::LAYER_NAMES;
+use crate::monitor::{GAME, INTERVAL, LAYER_NAMES};
 use crate::network::NetworkSignal;
 use crate::stats::Window;
 
 /// 判斷用的近期範圍：10 次 × 2 秒 = 20 秒
 pub const RECENT: usize = 10;
-/// 掉包率超過這個值就觸發，低於 LOSS_OFF 才算恢復（遲滯，避免來回觸發）
-const LOSS_ON: f64 = 20.0;
+/// 近期範圍的秒數，顯示「近 N 秒」用
+pub const RECENT_SECS: u64 = RECENT as u64 * INTERVAL.as_secs();
+/// 掉包率超過這個值就觸發，低於 LOSS_OFF 才算恢復（遲滯，避免來回觸發）。
+/// 診斷也用這個值判斷哪一層有問題，兩邊才一致
+pub const LOSS_ON: f64 = 20.0;
 const LOSS_OFF: f64 = 5.0;
 /// 遊戲伺服器連續逾時幾次算連不上
 const UNREACHABLE_AFTER: usize = 3;
@@ -20,8 +23,6 @@ const COOLDOWN_ROUNDS: u32 = 15;
 /// 遊戲連線近 20 秒重傳超過這個數就觸發，降到 RETRANS_OFF 以下才算恢復
 const RETRANS_ON: u32 = 5;
 const RETRANS_OFF: u32 = 1;
-
-const GAME: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IncidentKind {
@@ -119,7 +120,8 @@ impl EventDetector {
                 // 樣本太少時掉包率起伏太大（例如 2 筆掉 1 筆就是 50%），累積滿 RECENT 筆才判斷
                 w.len() >= RECENT && s.loss_pct >= LOSS_ON
             };
-            if self.high_loss[i] && !was {
+            // 遊戲伺服器已經在「連不上」狀態：掉包是同一件事，不再另外回報（狀態照樣更新，恢復時才不會補報）
+            if self.high_loss[i] && !was && !(i == GAME && unreachable) {
                 lowest_loss.get_or_insert(i);
             }
 
@@ -284,6 +286,22 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_game_is_not_reported_again_as_high_loss() {
+        let mut d = EventDetector::default();
+        let ok = [OK; 10];
+        let w = windows_from([&ok, &ok, &ok, &[OK, None, None, None]]);
+        assert_eq!(
+            check(&mut d, &w, false),
+            Some(IncidentKind::GameUnreachable)
+        );
+        // 持續連不上，樣本累積到可以判斷掉包率：同一件事，冷卻結束後也不再回報
+        let w = windows_from([&ok, &ok, &ok, &[None; 12]]);
+        for _ in 0..COOLDOWN_ROUNDS * 2 {
+            assert_eq!(check(&mut d, &w, false), None);
+        }
+    }
+
+    #[test]
     fn problem_recovered_during_cooldown_is_not_reported() {
         let mut d = EventDetector::default();
         let ok = [OK; 10];
@@ -364,8 +382,8 @@ mod tcp_tests {
             timeouts,
             retrans_recent,
             timeouts_recent: timeouts,
-            retrans_60s: retrans_recent,
-            timeouts_60s: timeouts,
+            retrans_window: retrans_recent,
+            timeouts_window: timeouts,
         }
     }
 

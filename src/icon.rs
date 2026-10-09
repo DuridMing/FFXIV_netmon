@@ -9,8 +9,42 @@ pub enum Health {
     Bad,
 }
 
+/// 掉包率達到這個值就算紅色（低於這個值但有掉包是黃色）。介面、報告、圖例都用這個
+pub const BAD_LOSS_PCT: f64 = 5.0;
+
 impl Health {
     pub const ALL: [Health; 4] = [Health::Unknown, Health::Good, Health::Warn, Health::Bad];
+
+    /// 依掉包率：BAD_LOSS_PCT 以上紅、有掉包黃
+    pub fn from_loss(loss_pct: f64) -> Self {
+        if loss_pct >= BAD_LOSS_PCT {
+            Health::Bad
+        } else if loss_pct > 0.0 {
+            Health::Warn
+        } else {
+            Health::Good
+        }
+    }
+
+    /// 依遊戲連線的 TCP 統計：有重傳逾時紅、有重傳黃
+    pub fn from_tcp(retrans: i64, timeouts: i64) -> Self {
+        if timeouts > 0 {
+            Health::Bad
+        } else if retrans > 0 {
+            Health::Warn
+        } else {
+            Health::Good
+        }
+    }
+
+    /// 匯出報告用的 CSS class
+    pub fn css_class(self) -> &'static str {
+        match self {
+            Health::Bad => "bad",
+            Health::Warn => "warn",
+            Health::Good | Health::Unknown => "",
+        }
+    }
 
     pub const fn rgb(self) -> [u8; 3] {
         match self {

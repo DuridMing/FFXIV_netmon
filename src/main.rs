@@ -33,8 +33,8 @@ mod win;
 
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -97,14 +97,24 @@ impl Renderer {
     }
 }
 
+const ARG_TARGET: &str = "--target";
+const ARG_RENDERER: &str = "--renderer";
+/// instance::acquire 靠這個旗標知道要等舊的程式結束
+const ARG_RESTARTED: &str = "--restarted";
+const ARG_CRASH_RESTARTS: &str = "--crash-restarts";
+const ARG_DATA_DIR: &str = "--data-dir";
+const ARG_DOCS_DIR: &str = "--docs-dir";
+const ARG_TEST_GPU_FAILURE: &str = "--test-gpu-failure";
+
+/// 目前用的繪圖方式，以系統管理員身分重新啟動時沿用
+static RENDERER: OnceLock<Renderer> = OnceLock::new();
+
 struct Options {
     target: Result<Option<SocketAddrV4>, String>,
     renderer: Renderer,
     restarted: bool,
     crash_restarts: u32,
     test_gpu_failure: bool,
-    /// 重新啟動時要原樣帶過去的參數（不含 --renderer、--restarted、--crash-restarts）
-    passthrough: Vec<String>,
 }
 
 impl Options {
@@ -116,52 +126,86 @@ impl Options {
                 .map(|i| args.get(i + 1).cloned())
         };
 
-        let target = match value_of("--target") {
+        let target = match value_of(ARG_TARGET) {
             None => Ok(None),
             Some(v) => v.and_then(|s| s.parse().ok()).map(Some).ok_or_else(|| {
                 "--target 格式錯誤，應為 IP:PORT，例如 --target 203.0.113.10:55006".to_string()
             }),
         };
-        let renderer = value_of("--renderer")
+        let renderer = value_of(ARG_RENDERER)
             .flatten()
             .and_then(|s| Renderer::parse(&s))
             .unwrap_or(Renderer::Dx12);
-        let crash_restarts = value_of("--crash-restarts")
+        let crash_restarts = value_of(ARG_CRASH_RESTARTS)
             .flatten()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        if let Some(dir) = value_of("--data-dir").flatten() {
+        if let Some(dir) = value_of(ARG_DATA_DIR).flatten() {
             storage::set_data_dir(PathBuf::from(dir));
         }
-        if let Some(dir) = value_of("--docs-dir").flatten() {
+        if let Some(dir) = value_of(ARG_DOCS_DIR).flatten() {
             report::set_export_dir(PathBuf::from(dir));
-        }
-
-        let mut passthrough = Vec::new();
-        let mut iter = args.iter();
-        while let Some(a) = iter.next() {
-            match a.as_str() {
-                "--renderer" | "--crash-restarts" => {
-                    iter.next();
-                }
-                "--restarted" => {}
-                _ => passthrough.push(a.clone()),
-            }
         }
 
         Options {
             target,
             renderer,
-            restarted: args.iter().any(|a| a == "--restarted"),
+            restarted: args.iter().any(|a| a == ARG_RESTARTED),
             crash_restarts,
-            test_gpu_failure: args.iter().any(|a| a == "--test-gpu-failure"),
-            passthrough,
+            test_gpu_failure: args.iter().any(|a| a == ARG_TEST_GPU_FAILURE),
         }
     }
 }
 
+/// 重新啟動自己時的參數：使用者給的參數照原樣保留，程式內部用的旗標重新產生。
+/// `set` 是要指定的 (參數, 值)，原本有同名參數時會取代掉
+fn restart_args(set: &[(&str, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut iter = std::env::args().skip(1);
+    while let Some(a) = iter.next() {
+        if a == ARG_RESTARTED {
+            continue;
+        }
+        if a == ARG_RENDERER || a == ARG_CRASH_RESTARTS || set.iter().any(|(f, _)| *f == a) {
+            iter.next();
+            continue;
+        }
+        out.push(a);
+    }
+    for (flag, value) in set {
+        out.push(flag.to_string());
+        out.push(value.clone());
+    }
+    // 新的程式會等這個結束後才開始，不會被當成重複開啟
+    out.push(ARG_RESTARTED.into());
+    out
+}
+
+/// 以系統管理員身分重新啟動時的參數。
+/// 用另一個系統管理員帳號的密碼提升權限時，新的程式是以那個帳號執行；
+/// 指定資料夾，記錄檔、設定和報告才會沿用原本使用者的
+pub fn admin_restart_args() -> Vec<String> {
+    let mut set = vec![(
+        ARG_RENDERER,
+        RENDERER
+            .get()
+            .copied()
+            .unwrap_or(Renderer::Dx12)
+            .arg()
+            .to_string(),
+    )];
+    if let Some(dir) = storage::data_dir() {
+        set.push((ARG_DATA_DIR, dir.display().to_string()));
+    }
+    if let Some(dir) = report::export_dir() {
+        set.push((ARG_DOCS_DIR, dir.display().to_string()));
+    }
+    restart_args(&set)
+}
+
 fn main() {
     let opts = Options::parse();
+    let _ = RENDERER.set(opts.renderer);
 
     let lock = match instance::acquire(if opts.restarted { RESTART_WAIT_MS } else { 0 }) {
         Acquire::Acquired(lock) => lock,
@@ -193,7 +237,7 @@ fn main() {
             return;
         }
         drop(lock);
-        if let Err(e) = relaunch(&opts, opts.renderer, count + 1) {
+        if let Err(e) = relaunch(opts.renderer, count + 1) {
             show_relaunch_failed(&err.to_string(), &e.to_string());
         }
         return;
@@ -202,7 +246,7 @@ fn main() {
     match opts.renderer.next() {
         Some(next) => {
             drop(lock);
-            if let Err(e) = relaunch(&opts, next, 0) {
+            if let Err(e) = relaunch(next, 0) {
                 show_relaunch_failed(&err.to_string(), &e.to_string());
             }
         }
@@ -308,14 +352,15 @@ fn dx12_config(software: bool, test_failure: bool) -> eframe::WgpuConfiguration 
     config
 }
 
-fn relaunch(opts: &Options, renderer: Renderer, crash_restarts: u32) -> std::io::Result<()> {
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.args(&opts.passthrough)
-        .args(["--renderer", renderer.arg(), "--restarted"]);
+fn relaunch(renderer: Renderer, crash_restarts: u32) -> std::io::Result<()> {
+    let mut set = vec![(ARG_RENDERER, renderer.arg().to_string())];
     if crash_restarts > 0 {
-        cmd.args(["--crash-restarts", &crash_restarts.to_string()]);
+        set.push((ARG_CRASH_RESTARTS, crash_restarts.to_string()));
     }
-    cmd.spawn().map(|_| ())
+    std::process::Command::new(std::env::current_exe()?)
+        .args(restart_args(&set))
+        .spawn()
+        .map(|_| ())
 }
 
 /// 畫面出錯後要重新啟動自己，但啟動失敗

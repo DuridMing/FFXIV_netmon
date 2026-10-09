@@ -31,13 +31,15 @@ pub enum TrayCommand {
 }
 
 const WM_TRAY: u32 = WM_APP + 1;
+/// 介面執行緒更新了燈號或提示文字，請系統匣執行緒送給檔案總管
+const WM_TRAY_UPDATE: u32 = WM_APP + 2;
 const TRAY_CLASS: PCWSTR = w!("ff14-netmon-tray");
 const TRAY_TITLE: PCWSTR = w!("FF14 連線監測");
 const ICON_ID: u32 = 1;
 const MENU_SHOW: usize = 1;
 const MENU_EXIT: usize = 2;
 const ICON_SIZE: u32 = 32;
-/// 圖示加入失敗（例如工作列忙碌）時，每隔多久再試一次
+/// 圖示加入或更新失敗（例如工作列忙碌）時，每隔多久再試一次
 const RETRY_TIMER_ID: usize = 1;
 const RETRY_MS: u32 = 2000;
 
@@ -49,8 +51,11 @@ pub struct Tray {
 }
 
 struct State {
+    /// 要顯示的燈號和提示文字
     health: Health,
     tip: String,
+    /// 檔案總管目前顯示的燈號和提示文字；None 代表還沒成功送過
+    shown: Option<(Health, String)>,
 }
 
 static HANDLER: OnceLock<Box<dyn Fn(TrayCommand) + Send + Sync>> = OnceLock::new();
@@ -58,11 +63,14 @@ static TRAY: OnceLock<Tray> = OnceLock::new();
 static STATE: Mutex<State> = Mutex::new(State {
     health: Health::Unknown,
     tip: String::new(),
+    shown: None,
 });
 /// 檔案總管重啟後會廣播這個訊息，要重新加入圖示
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 /// 圖示目前有沒有成功加到系統匣
 static ADDED: AtomicBool = AtomicBool::new(false);
+/// 已經送出 WM_TRAY_UPDATE、系統匣執行緒還沒處理
+static UPDATE_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// 建立系統匣圖示。使用者點圖示或選單時會呼叫 `handler`（在系統匣執行緒上）。
 pub fn spawn(tip: &str, handler: impl Fn(TrayCommand) + Send + Sync + 'static) -> Option<Tray> {
@@ -111,7 +119,7 @@ pub fn spawn(tip: &str, handler: impl Fn(TrayCommand) + Send + Sync + 'static) -
             icons: Health::ALL.map(|h| make_icon(hinstance, h)),
         };
         let _ = TRAY.set(tray);
-        tray.add_or_retry();
+        tray.sync();
         let _ = tx.send(Some(tray));
 
         let mut msg = MSG::default();
@@ -137,28 +145,74 @@ impl Tray {
         HICON(self.icons[i] as *mut c_void)
     }
 
+    fn hwnd(&self) -> HWND {
+        HWND(self.hwnd as *mut c_void)
+    }
+
+    /// 目前要顯示的狀態。呼叫檔案總管時不能拿著鎖，不然它忙碌時介面執行緒也會被卡住
+    fn desired() -> Option<(Health, String)> {
+        let state = STATE.lock().ok()?;
+        Some((state.health, state.tip.clone()))
+    }
+
+    fn mark_shown(shown: Option<(Health, String)>) {
+        if let Ok(mut state) = STATE.lock() {
+            state.shown = shown;
+        }
+    }
+
     fn add(&self) -> bool {
-        let Ok(state) = STATE.lock() else {
+        let Some((health, tip)) = Self::desired() else {
             return false;
         };
         let mut d = self.data();
         d.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         d.uCallbackMessage = WM_TRAY;
-        d.hIcon = self.icon(state.health);
-        copy_wide(&mut d.szTip, &state.tip);
+        d.hIcon = self.icon(health);
+        copy_wide(&mut d.szTip, &tip);
         let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &d) }.as_bool();
         ADDED.store(ok, Ordering::SeqCst);
+        Self::mark_shown(ok.then_some((health, tip)));
         ok
     }
 
-    /// 在系統匣執行緒上呼叫：加入圖示，失敗時開計時器定期重試
-    fn add_or_retry(&self) {
-        let hwnd = Some(HWND(self.hwnd as *mut c_void));
+    /// 把要顯示的燈號和提示文字送給檔案總管；燈號沒變就不重送圖示。成功或不需要更新時回傳 true
+    fn apply(&self) -> bool {
+        let Some((health, tip)) = Self::desired() else {
+            return true;
+        };
+        let shown = STATE.lock().ok().and_then(|s| s.shown.clone());
+        let mut d = self.data();
+        if shown.as_ref().is_none_or(|(h, _)| *h != health) {
+            d.uFlags |= NIF_ICON;
+            d.hIcon = self.icon(health);
+        }
+        if shown.as_ref().is_none_or(|(_, t)| *t != tip) {
+            d.uFlags |= NIF_TIP;
+            copy_wide(&mut d.szTip, &tip);
+        }
+        if d.uFlags.0 == 0 {
+            return true;
+        }
+        let ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &d) }.as_bool();
+        if ok {
+            Self::mark_shown(Some((health, tip)));
+        }
+        ok
+    }
+
+    /// 在系統匣執行緒上呼叫：圖示還沒加入就加入，已加入就更新狀態；失敗時開計時器定期重試
+    fn sync(&self) {
+        let done = if self.is_shown() {
+            self.apply()
+        } else {
+            self.add()
+        };
         unsafe {
-            if self.add() {
-                let _ = KillTimer(hwnd, RETRY_TIMER_ID);
+            if done {
+                let _ = KillTimer(Some(self.hwnd()), RETRY_TIMER_ID);
             } else {
-                SetTimer(hwnd, RETRY_TIMER_ID, RETRY_MS, None);
+                SetTimer(Some(self.hwnd()), RETRY_TIMER_ID, RETRY_MS, None);
             }
         }
     }
@@ -168,23 +222,21 @@ impl Tray {
         ADDED.load(Ordering::SeqCst)
     }
 
-    /// 更新燈號顏色和滑鼠提示文字；沒有變化就不呼叫系統。
-    /// 系統沒有接受這次更新時不記下新狀態，下一次呼叫會再送一次
+    /// 更新燈號顏色和滑鼠提示文字。實際送給檔案總管的工作交給系統匣執行緒，
+    /// 檔案總管忙碌時介面才不會卡住；送失敗時系統匣執行緒會自己重試
     pub fn set_status(&self, health: Health, tip: &str) {
-        let Ok(mut state) = STATE.lock() else { return };
-        if state.health == health && state.tip == tip {
-            return;
-        }
-
-        let mut d = self.data();
-        d.uFlags = NIF_ICON | NIF_TIP;
-        d.hIcon = self.icon(health);
-        copy_wide(&mut d.szTip, tip);
-        let ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &d) }.as_bool();
-        // 圖示還沒加入時也要記下來，加入時才會用最新的狀態
-        if ok || !self.is_shown() {
+        {
+            let Ok(mut state) = STATE.lock() else { return };
+            if state.health == health && state.tip == tip {
+                return;
+            }
             state.health = health;
             state.tip = tip.to_string();
+        }
+        if !UPDATE_PENDING.swap(true, Ordering::SeqCst) {
+            unsafe {
+                let _ = PostMessageW(Some(self.hwnd()), WM_TRAY_UPDATE, WPARAM(0), LPARAM(0));
+            }
         }
     }
 
@@ -241,11 +293,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         return LRESULT(0);
     }
     let taskbar_created = TASKBAR_CREATED.load(Ordering::Relaxed);
+    if taskbar_created != 0 && msg == taskbar_created {
+        // 檔案總管重新啟動，圖示已經不見了
+        ADDED.store(false, Ordering::SeqCst);
+    }
+    if msg == WM_TRAY_UPDATE {
+        UPDATE_PENDING.store(false, Ordering::SeqCst);
+    }
     if ((taskbar_created != 0 && msg == taskbar_created)
+        || msg == WM_TRAY_UPDATE
         || (msg == WM_TIMER && wparam.0 == RETRY_TIMER_ID))
         && let Some(tray) = TRAY.get()
     {
-        tray.add_or_retry();
+        tray.sync();
+        return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }

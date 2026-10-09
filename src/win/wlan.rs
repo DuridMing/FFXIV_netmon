@@ -8,15 +8,14 @@ use std::ffi::c_void;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WiFi::{
-    WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO, WLAN_INTERFACE_INFO_LIST, WlanCloseHandle,
-    WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
-    wlan_interface_state_connected, wlan_intf_opcode_current_connection, wlan_intf_opcode_rssi,
+    WLAN_API_VERSION_2_0, WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO,
+    WLAN_INTERFACE_INFO_LIST, WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle,
+    WlanQueryInterface, wlan_interface_state_connected, wlan_intf_opcode_current_connection,
+    wlan_intf_opcode_rssi,
 };
 use windows::core::GUID;
 
-/// WLAN API 版本 2（Vista 以後）
-const CLIENT_VERSION: u32 = 2;
-pub const ERROR_ACCESS_DENIED: u32 = 5;
+pub const ERROR_ACCESS_DENIED: u32 = windows::Win32::Foundation::ERROR_ACCESS_DENIED.0;
 
 /// 讀取失敗時的 Windows 錯誤碼
 pub type WlanError = u32;
@@ -28,7 +27,7 @@ impl Wlan {
     pub fn open() -> Option<Self> {
         let mut version = 0;
         let mut handle = HANDLE::default();
-        let ret = unsafe { WlanOpenHandle(CLIENT_VERSION, None, &mut version, &mut handle) };
+        let ret = unsafe { WlanOpenHandle(WLAN_API_VERSION_2_0, None, &mut version, &mut handle) };
         (ret == 0).then_some(Self(handle))
     }
 

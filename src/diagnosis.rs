@@ -2,39 +2,31 @@
 
 use std::net::Ipv4Addr;
 
-use crate::events::IncidentKind;
-use crate::monitor::LAYER_NAMES;
+use crate::events::{IncidentKind, LOSS_ON, RECENT_SECS};
+use crate::monitor::{GAME, GATEWAY, INTERNET, ISP, LAYER_NAMES};
 use crate::stats::Summary;
 use crate::trace::Trace;
+use crate::wifi::WEAK_WIFI;
 use crate::win::netif::NetIf;
-
-/// 近期掉包率超過這個值，或最近一次逾時，就算這層有問題
-const BAD_LOSS: f64 = 20.0;
-
-const GATEWAY: usize = 0;
-const ISP: usize = 1;
-const INTERNET: usize = 2;
-const GAME: usize = 3;
 
 #[derive(Clone)]
 pub struct LayerState {
     pub has_probe: bool,
     /// 最近一次結果：None = 逾時
     pub last: Option<Option<u32>>,
-    /// 近期（約 20 秒）統計
+    /// 近期（RECENT 輪）統計
     pub recent: Option<Summary>,
 }
 
 impl LayerState {
+    /// 最近一次逾時，或近期掉包率達到事件的觸發門檻，就算這層有問題。
+    /// 跟事件用同一個門檻，「大量掉包」事件的診斷才一定找得到出問題的那層
     fn is_bad(&self) -> bool {
         self.has_probe
             && (matches!(self.last, Some(None))
-                || self.recent.is_some_and(|s| s.loss_pct >= BAD_LOSS))
+                || self.recent.is_some_and(|s| s.loss_pct >= LOSS_ON))
     }
 }
-
-/// Wi-Fi 訊號低於這個值，家中網路的問題就很可能是 Wi-Fi 造成的
-const WEAK_WIFI: u32 = 50;
 
 /// 診斷時參考的額外資訊
 #[derive(Default)]
@@ -45,7 +37,7 @@ pub struct Context<'a> {
     pub wifi_quality: Option<u32>,
     /// 中間節點追蹤找到的持續掉包起點：(跳數, 位址)
     pub hop_loss_origin: Option<(u8, Option<Ipv4Addr>)>,
-    /// 遊戲連線近 20 秒的重傳封包數；沒有系統管理員權限時為 None
+    /// 遊戲連線近期（RECENT 輪）的重傳封包數；沒有系統管理員權限時為 None
     pub retrans_recent: Option<u32>,
     /// 上網用的網卡；網路中斷時是最後一張用過的網卡
     pub net_if: Option<&'a NetIf>,
@@ -107,7 +99,7 @@ fn diagnose_network(kind: IncidentKind, layers: &[LayerState; 4], ctx: &Context)
         None if kind == IncidentKind::GameRetransmits => {
             let n = ctx.retrans_recent.unwrap_or(0);
             format!(
-                "遊戲連線本身在掉包：ping 各層都正常，但遊戲連線近 20 秒重傳了 {n} 個封包。{}",
+                "遊戲連線本身在掉包：ping 各層都正常，但遊戲連線近 {RECENT_SECS} 秒重傳了 {n} 個封包。{}",
                 path_note(ctx)
             )
         }
@@ -121,7 +113,7 @@ fn diagnose_network(kind: IncidentKind, layers: &[LayerState; 4], ctx: &Context)
                     .to_string();
             if let Some(n) = ctx.retrans_recent.filter(|&n| n > 0) {
                 text.push_str(&format!(
-                    "不過斷線前 20 秒遊戲連線重傳了 {n} 個封包，網路路徑可能有問題。"
+                    "不過斷線前 {RECENT_SECS} 秒遊戲連線重傳了 {n} 個封包，網路路徑可能有問題。"
                 ));
             }
             text

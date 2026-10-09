@@ -6,6 +6,8 @@ use crate::win::wlan::{self, ERROR_ACCESS_DENIED, Wlan};
 
 /// 每幾輪重讀一次 SSID（30 × 2 秒 = 1 分鐘）
 const SSID_REFRESH_ROUNDS: u32 = 30;
+/// 訊號低於這個值算偏弱：介面用黃色提醒，家中網路問題時建議改用有線
+pub const WEAK_WIFI: u32 = 50;
 /// WLAN 服務打不開時，每幾輪重試一次（15 × 2 秒 = 30 秒）
 const REOPEN_ROUNDS: u32 = 15;
 

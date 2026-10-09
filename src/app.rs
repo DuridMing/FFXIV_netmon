@@ -1,6 +1,6 @@
 //! egui 介面：遊戲狀態、各層狀態表、即時延遲圖、事件列表；系統匣常駐、通知、匯出報告。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::thread;
 
@@ -9,16 +9,15 @@ use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoints, Points, VLine};
 
 use crate::game_tcp::TcpStatus;
-use crate::hops::HopReport;
 use crate::icon::Health;
 use crate::monitor::{
-    GameStatus, Incident, LAYER_NAMES, LayerReport, Monitor, MonitorMsg, WINDOW_SIZE,
+    GAME, GameStatus, Incident, LAYER_NAMES, LayerReport, Monitor, MonitorMsg, Round, WINDOW_SECS,
 };
 use crate::report::{self, Exported};
 use crate::settings::{CloseAction, Settings};
+use crate::stats::{fmt_ms, fmt_rtt};
 use crate::storage;
-use crate::wifi::{self, WifiStatus};
-use crate::win::netif::NetIf;
+use crate::wifi::{self, WEAK_WIFI, WifiStatus};
 use crate::win::tray::{Tray, TrayCommand};
 use crate::win::{elevation, shell, time};
 
@@ -29,7 +28,6 @@ const CHART_SPAN_SECS: f64 = 600.0;
 /// 圖表 Y 軸至少顯示到這個值，延遲很低時線才不會貼滿整張圖
 const CHART_MIN_Y_MS: f64 = 10.0;
 const MAX_EVENTS: usize = 500;
-const GAME_LAYER: usize = 3;
 /// 中文字型候選，依序嘗試（都在 Windows 字型資料夾）。
 /// 繁中版 Windows 有微軟正黑體；其他語言版本不一定有，就退而求其次用其他含中文字的字型
 /// 第三個欄位：這個字型是否涵蓋大部分繁體中文字（日文字型缺很多繁體字）
@@ -42,8 +40,6 @@ const FONT_CANDIDATES: [(&str, &str, bool); 6] = [
     ("YuGothM.ttc", "Yu Gothic", false),
     ("meiryo.ttc", "Meiryo", false),
 ];
-/// 低於這個 Wi-Fi 訊號就用黃色提醒
-const WEAK_WIFI: u32 = 50;
 const LOCATION_HINT: &str = "Windows 11 把讀取 Wi-Fi 資訊當成存取位置。\
     到 Windows 設定 →「隱私權與安全性」→「位置」，開啟「位置服務」和「允許桌面應用程式存取您的位置」就能顯示。";
 
@@ -70,31 +66,28 @@ const fn rgb(health: Health) -> Color32 {
 }
 
 struct EventEntry {
-    /// 給可展開區塊當唯一 ID
+    /// 給可展開區塊當唯一 ID，越新的越大
     id: u64,
-    time: String,
-    text: String,
-    severe: bool,
-    /// 異常事件才有：診斷結論與詳細數據
-    incident: Option<Incident>,
+    kind: EntryKind,
+}
+
+enum EntryKind {
+    /// 一般訊息
+    Plain {
+        time: String,
+        text: String,
+        severe: bool,
+    },
+    /// 異常事件：有診斷結論與詳細數據，可以展開
+    Incident(Incident),
 }
 
 pub struct App {
     monitor: Monitor,
     /// 啟動進度，空字串代表已就緒
     status: String,
-    game: Option<GameStatus>,
-    layers: Vec<LayerReport>,
-    wifi: WifiStatus,
-    net_if: Option<NetIf>,
-    /// 電腦網路斷線的原因；None 代表網路正常
-    network_down: Option<String>,
-    /// 記錄檔寫入失敗的原因；None 代表正常
-    storage_error: Option<String>,
-    tcp: Option<TcpStatus>,
-    hop_target: Option<std::net::Ipv4Addr>,
-    hops: Vec<HopReport>,
-    hop_loss_origin: Option<(u8, Option<std::net::Ipv4Addr>)>,
+    /// 最新一輪的量測結果；還沒收到任何一輪時為 None
+    round: Option<Round>,
     tab: Tab,
     /// 每層的 (經過秒數, 延遲)；延遲 None 代表逾時
     history: [VecDeque<(f64, Option<u32>)>; 4],
@@ -104,6 +97,8 @@ pub struct App {
     clock_base_secs: Option<i64>,
     /// 最新的在最前面
     events: VecDeque<EventEntry>,
+    /// 事件列表每一筆實際畫出來的高度（依事件 id），只排版看得到的事件時用
+    event_heights: HashMap<u64, f32>,
     next_event_id: u64,
 
     /// 建立系統匣失敗時為 None，此時關閉視窗就直接結束
@@ -132,21 +127,13 @@ impl App {
         let mut app = Self {
             monitor,
             status: "啟動中...".into(),
-            game: None,
-            layers: Vec::new(),
-            wifi: WifiStatus::NotUsed,
-            net_if: None,
-            network_down: None,
-            storage_error: None,
-            tcp: None,
-            hop_target: None,
-            hops: Vec::new(),
-            hop_loss_origin: None,
+            round: None,
             tab: Tab::Chart,
             history: Default::default(),
             round_times: VecDeque::new(),
             clock_base_secs: None,
             events: VecDeque::new(),
+            event_heights: HashMap::new(),
             next_event_id: 0,
             tray,
             tray_rx,
@@ -190,19 +177,20 @@ impl App {
     }
 
     fn push_event(&mut self, time: String, text: String, severe: bool) {
-        self.push_entry(time, text, severe, None);
+        self.push_entry(EntryKind::Plain { time, text, severe });
     }
 
-    fn push_entry(&mut self, time: String, text: String, severe: bool, incident: Option<Incident>) {
+    fn push_entry(&mut self, kind: EntryKind) {
         self.next_event_id += 1;
         self.events.push_front(EventEntry {
             id: self.next_event_id,
-            time,
-            text,
-            severe,
-            incident,
+            kind,
         });
         self.events.truncate(MAX_EVENTS);
+        // 已經被擠掉的事件不用再記高度（id 越新越大，最後一筆是最舊的）
+        if let Some(oldest) = self.events.back().map(|e| e.id) {
+            self.event_heights.retain(|&id, _| id >= oldest);
+        }
     }
 
     fn drain_messages(&mut self) {
@@ -216,30 +204,11 @@ impl App {
                     {
                         tray.notify(&format!("⚠ {}", incident.title), &incident.diagnosis);
                     }
-                    let (time, text) = (incident.time.clone(), incident.title.clone());
-                    self.push_entry(time, text, true, Some(incident));
+                    self.push_entry(EntryKind::Incident(incident));
                 }
-                MonitorMsg::Round {
-                    elapsed,
-                    wifi,
-                    game,
-                    layers,
-                    tcp,
-                    hop_target,
-                    hops,
-                    hop_loss_origin,
-                    net_if,
-                    network_down,
-                    storage_error,
-                } => {
-                    self.net_if = net_if;
-                    self.network_down = network_down;
-                    self.storage_error = storage_error;
-                    self.tcp = Some(tcp);
-                    self.hop_target = hop_target;
-                    self.hops = hops;
-                    self.hop_loss_origin = hop_loss_origin;
-                    for (history, report) in self.history.iter_mut().zip(&layers) {
+                MonitorMsg::Round(round) => {
+                    let elapsed = round.elapsed;
+                    for (history, report) in self.history.iter_mut().zip(&round.layers) {
                         match report.last {
                             Some(r) => history.push_back((elapsed, r)),
                             // 這一輪無法量測：圖上留空，不要清掉
@@ -257,31 +226,36 @@ impl App {
                     if self.round_times.len() > HISTORY {
                         self.round_times.pop_front();
                     }
-                    self.game = Some(game);
-                    self.layers = layers;
-                    self.wifi = wifi;
+                    self.round = Some(round);
                     self.update_tray();
                 }
             }
         }
     }
 
+    fn game(&self) -> Option<&GameStatus> {
+        self.round.as_ref().map(|r| &r.game)
+    }
+
+    fn layer(&self, i: usize) -> Option<&LayerReport> {
+        self.round.as_ref()?.layers.get(i)
+    }
+
     /// 整體燈號：有遊戲目標時看遊戲伺服器那層，否則看遊戲狀態
     fn overall_health(&self) -> Health {
-        match &self.game {
+        match self.game() {
             None | Some(GameStatus::NotRunning) => Health::Unknown,
             Some(GameStatus::NoConnection) => Health::Warn,
             Some(GameStatus::Connected(_) | GameStatus::Manual(_)) => self
-                .layers
-                .get(GAME_LAYER)
+                .layer(GAME)
                 .map_or(Health::Unknown, |r| layer_state(r).0),
         }
     }
 
     fn update_tray(&self) {
         let Some(tray) = &self.tray else { return };
-        let game_layer = self.layers.get(GAME_LAYER);
-        let game = match (&self.game, game_layer.and_then(|r| r.last)) {
+        let game_layer = self.layer(GAME);
+        let game = match (self.game(), game_layer.and_then(|r| r.last)) {
             (Some(GameStatus::Connected(_) | GameStatus::Manual(_)), Some(Some(ms))) => {
                 format!("遊戲伺服器 {ms} ms")
             }
@@ -295,7 +269,7 @@ impl App {
             _ => "遊戲未執行".into(),
         };
         let mut tip = format!("FF14 連線監測\n{game}");
-        if let Some(w) = self.wifi.info() {
+        if let Some(w) = self.round.as_ref().and_then(|r| r.wifi.info()) {
             tip.push_str(&format!("\nWi-Fi 訊號 {}%", w.quality));
         }
         tray.set_status(self.overall_health(), &tip);
@@ -415,6 +389,7 @@ impl App {
         match result {
             Ok(()) => {
                 self.events.clear();
+                self.event_heights.clear();
                 self.push_event(time::now_hms(), "已清除所有紀錄".into(), false);
             }
             Err(e) => self.push_event(time::now_hms(), format!("清除紀錄失敗：{e}"), true),
@@ -507,7 +482,7 @@ impl App {
 
     fn header_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let text = match &self.game {
+            let text = match self.game() {
                 None => "遊戲狀態：等待中".to_string(),
                 Some(GameStatus::NotRunning) => "遊戲狀態：未執行".to_string(),
                 Some(GameStatus::NoConnection) => "遊戲狀態：未連線".to_string(),
@@ -548,52 +523,54 @@ impl App {
             });
         });
 
-        ui.horizontal_wrapped(|ui| {
-            match (&self.net_if, &self.network_down) {
-                (Some(n), None) => {
-                    ui.label(RichText::new(format!("網路：{}", n.summary())).color(GRAY))
-                        .on_hover_text(&n.description);
-                }
-                (Some(n), Some(reason)) => {
-                    ui.label(
-                        RichText::new(format!("網路中斷：{}（{reason}）", n.alias)).color(RED),
-                    );
-                }
-                (None, Some(reason)) => {
-                    ui.label(RichText::new(format!("網路中斷：{reason}")).color(RED));
-                }
-                (None, None) => {}
-            }
-            match &self.wifi {
-                WifiStatus::Connected(w) => {
-                    let color = if w.quality < WEAK_WIFI { YELLOW } else { GRAY };
-                    ui.label(
-                        RichText::new(format!("Wi-Fi：{}　訊號 {}%", w.ssid_text(), w.quality))
-                            .color(color),
-                    );
-                    if w.quality < WEAK_WIFI {
-                        ui.label(RichText::new("訊號偏弱，建議改用有線網路").color(YELLOW));
+        if let Some(round) = &self.round {
+            ui.horizontal_wrapped(|ui| {
+                match (&round.net_if, &round.network_down) {
+                    (Some(n), None) => {
+                        ui.label(RichText::new(format!("網路：{}", n.summary())).color(GRAY))
+                            .on_hover_text(&n.description);
                     }
-                }
-                WifiStatus::Unreadable(reason) => {
-                    let label = ui.label(
-                        RichText::new(format!("Wi-Fi：無法讀取訊號（{reason}）")).color(GRAY),
-                    );
-                    if *reason == wifi::NEED_LOCATION {
-                        label.on_hover_text(LOCATION_HINT);
+                    (Some(n), Some(reason)) => {
+                        ui.label(
+                            RichText::new(format!("網路中斷：{}（{reason}）", n.alias)).color(RED),
+                        );
                     }
+                    (None, Some(reason)) => {
+                        ui.label(RichText::new(format!("網路中斷：{reason}")).color(RED));
+                    }
+                    (None, None) => {}
                 }
-                WifiStatus::NotUsed | WifiStatus::Disconnected => {}
-            }
-        });
+                match &round.wifi {
+                    WifiStatus::Connected(w) => {
+                        let color = if w.quality < WEAK_WIFI { YELLOW } else { GRAY };
+                        ui.label(
+                            RichText::new(format!("Wi-Fi：{}　訊號 {}%", w.ssid_text(), w.quality))
+                                .color(color),
+                        );
+                        if w.quality < WEAK_WIFI {
+                            ui.label(RichText::new("訊號偏弱，建議改用有線網路").color(YELLOW));
+                        }
+                    }
+                    WifiStatus::Unreadable(reason) => {
+                        let label = ui.label(
+                            RichText::new(format!("Wi-Fi：無法讀取訊號（{reason}）")).color(GRAY),
+                        );
+                        if *reason == wifi::NEED_LOCATION {
+                            label.on_hover_text(LOCATION_HINT);
+                        }
+                    }
+                    WifiStatus::NotUsed | WifiStatus::Disconnected => {}
+                }
+            });
 
-        if let Some(e) = &self.storage_error {
-            ui.label(
-                RichText::new(format!(
-                    "記錄檔寫入失敗，資料暫存在記憶體，每分鐘會再試一次：{e}"
-                ))
-                .color(RED),
-            );
+            if let Some(e) = &round.storage_error {
+                ui.label(
+                    RichText::new(format!(
+                        "記錄檔寫入失敗，資料暫存在記憶體，每分鐘會再試一次：{e}"
+                    ))
+                    .color(RED),
+                );
+            }
         }
 
         if let Some(i) = self.latest_incident() {
@@ -607,8 +584,8 @@ impl App {
     /// 遊戲連線本身的 TCP 統計（需要系統管理員權限）
     fn tcp_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("遊戲連線（TCP）").strong().color(LAYER_COLORS[GAME_LAYER]));
-            match self.tcp {
+            ui.label(RichText::new("遊戲連線（TCP）").strong().color(LAYER_COLORS[GAME]));
+            match self.round.as_ref().map(|r| r.tcp) {
                 None | Some(TcpStatus::NoConnection) => {
                     ui.label(RichText::new("沒有遊戲連線").color(GRAY));
                 }
@@ -635,17 +612,17 @@ impl App {
                 Some(TcpStatus::Stats(t)) => {
                     ui.label(format!("實際延遲 {} ms（變動 ±{} ms）", t.smoothed_rtt_ms, t.rtt_var_ms));
                     ui.separator();
-                    let color = if t.timeouts_60s > 0 {
-                        RED
-                    } else if t.retrans_60s > 0 {
-                        YELLOW
-                    } else {
-                        GRAY
+                    let color = match Health::from_tcp(
+                        t.retrans_window.into(),
+                        t.timeouts_window.into(),
+                    ) {
+                        Health::Good => GRAY,
+                        h => rgb(h),
                     };
                     ui.label(
                         RichText::new(format!(
-                            "近 60 秒重傳 {} 個封包、逾時 {} 次",
-                            t.retrans_60s, t.timeouts_60s
+                            "近 {WINDOW_SECS} 秒重傳 {} 個封包、逾時 {} 次",
+                            t.retrans_window, t.timeouts_window
                         ))
                         .color(color),
                     )
@@ -658,16 +635,7 @@ impl App {
     }
 
     fn restart_as_admin(&mut self, ctx: &egui::Context) {
-        // 用另一個系統管理員帳號的密碼提升權限時，新的程式是以那個帳號執行；
-        // 指定資料夾，記錄檔、設定和報告才會沿用原本使用者的
-        let mut folders = Vec::new();
-        if let Some(dir) = storage::data_dir() {
-            folders.push(("--data-dir", dir.display().to_string()));
-        }
-        if let Some(dir) = report::export_dir() {
-            folders.push(("--docs-dir", dir.display().to_string()));
-        }
-        if elevation::restart_as_admin(&folders) {
+        if elevation::restart_as_admin(&crate::admin_restart_args()) {
             // 新的程式已經用系統管理員身分啟動，這個直接結束
             self.quitting = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -682,13 +650,19 @@ impl App {
 
     /// 中間節點追蹤（類似 MTR）
     fn hops_ui(&self, ui: &mut egui::Ui) {
-        let Some(target) = self.hop_target else {
+        let Some(Round {
+            hop_target: Some(target),
+            hops,
+            hop_loss_origin,
+            ..
+        }) = &self.round
+        else {
             ui.label(RichText::new("連上遊戲伺服器後，會開始追蹤路徑上的每一個節點。").color(GRAY));
             return;
         };
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!("到 {target} 的路徑（近 60 秒）"));
-            match self.hop_loss_origin {
+            ui.label(format!("到 {target} 的路徑（近 {WINDOW_SECS} 秒）"));
+            match hop_loss_origin {
                 Some((ttl, addr)) => {
                     let addr = addr.map(|a| format!("（{a}）")).unwrap_or_default();
                     ui.label(RichText::new(format!("從第 {ttl} 跳{addr}開始持續掉包")).color(RED));
@@ -705,7 +679,7 @@ impl App {
             .small()
             .color(GRAY),
         );
-        if self.hops.is_empty() {
+        if hops.is_empty() {
             ui.label(RichText::new("追蹤中...").color(GRAY));
             return;
         }
@@ -723,8 +697,8 @@ impl App {
                         }
                         ui.end_row();
 
-                        let origin = self.hop_loss_origin.map(|(ttl, _)| ttl);
-                        for h in &self.hops {
+                        let origin = hop_loss_origin.map(|(ttl, _)| ttl);
+                        for h in hops {
                             let in_lossy_part = origin.is_some_and(|o| h.ttl >= o);
                             let ttl = RichText::new(h.ttl.to_string());
                             ui.label(if in_lossy_part { ttl.color(RED) } else { ttl });
@@ -732,12 +706,8 @@ impl App {
                                 h.addr
                                     .map_or("*（沒有回應）".to_string(), |a| a.to_string()),
                             );
-                            ui.label(h.last.map_or("逾時".to_string(), |ms| format!("{ms} ms")));
-                            ui.label(
-                                h.summary
-                                    .and_then(|s| s.avg_ms)
-                                    .map_or("-".to_string(), |v| format!("{v:.1} ms")),
-                            );
+                            ui.label(fmt_rtt(h.last));
+                            ui.label(fmt_ms(h.summary.and_then(|s| s.avg_ms)));
                             let loss = h.summary.map_or(0.0, |s| s.loss_pct);
                             let color = if in_lossy_part {
                                 RED
@@ -754,10 +724,7 @@ impl App {
     }
 
     fn table_ui(&self, ui: &mut egui::Ui) {
-        ui.label(format!(
-            "統計範圍：最近 {} 秒",
-            WINDOW_SIZE as u64 * crate::monitor::INTERVAL.as_secs()
-        ));
+        ui.label(format!("統計範圍：最近 {WINDOW_SECS} 秒"));
         egui::Grid::new("layers")
             .striped(true)
             .num_columns(7)
@@ -769,19 +736,16 @@ impl App {
                 ui.end_row();
 
                 for (i, name) in LAYER_NAMES.iter().enumerate() {
-                    let report = self.layers.get(i);
+                    let report = self.layer(i);
                     ui.label(RichText::new(*name).color(LAYER_COLORS[i]).strong());
                     ui.label(report.and_then(|r| r.target.clone()).unwrap_or("-".into()));
 
                     let last = match report.and_then(|r| r.last) {
                         None if report.is_some_and(|r| r.failed) => "無法量測".to_string(),
                         None => "-".to_string(),
-                        Some(None) => "逾時".to_string(),
-                        Some(Some(ms)) => format!("{ms} ms"),
+                        Some(rtt) => fmt_rtt(rtt),
                     };
                     let summary = report.and_then(|r| r.summary);
-                    let fmt_ms =
-                        |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.1} ms"));
                     ui.label(last);
                     ui.label(fmt_ms(summary.and_then(|s| s.avg_ms)));
                     ui.label(fmt_ms(summary.and_then(|s| s.jitter_ms)));
@@ -887,10 +851,8 @@ impl App {
                     .num_columns(2)
                     .show(ui, |ui| {
                         for (i, history) in self.history.iter().enumerate() {
-                            let value = match value_at(history, x) {
-                                Some(Some(ms)) => format!("{ms} ms"),
-                                Some(None) => "逾時".into(),
-                                None => continue,
+                            let Some(value) = value_at(history, x).map(fmt_rtt) else {
+                                continue;
                             };
                             ui.label(RichText::new(LAYER_NAMES[i]).color(LAYER_COLORS[i]));
                             let text = RichText::new(value);
@@ -914,28 +876,65 @@ impl App {
             .cloned()
     }
 
-    fn events_ui(&self, ui: &mut egui::Ui) {
+    /// 事件列表。最多 500 筆，只排版看得到的那幾筆：每一筆的高度記下來，
+    /// 看不到的就直接跳過那段高度（異常事件可以展開，高度不固定，第一次畫之前先用估計值）
+    fn events_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("事件紀錄").strong());
+        let gap = ui.spacing().item_spacing.y;
+        let line = ui.spacing().interact_size.y;
+        let estimate = |e: &EventEntry| match e.kind {
+            EntryKind::Plain { .. } => line,
+            // 標題列加上一行診斷
+            EntryKind::Incident(_) => line * 2.0 + gap,
+        };
+        let events = &self.events;
+        let heights = &mut self.event_heights;
+        let height_of = |e: &EventEntry, heights: &HashMap<u64, f32>| {
+            heights.get(&e.id).copied().unwrap_or_else(|| estimate(e))
+        };
+        let total: f32 = events.iter().map(|e| height_of(e, heights) + gap).sum();
+
         egui::ScrollArea::vertical()
             .auto_shrink(false)
-            .show(ui, |ui| {
-                for e in &self.events {
-                    match &e.incident {
-                        None => {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(&e.time).monospace().color(GRAY));
-                                let text = RichText::new(&e.text);
-                                ui.label(if e.severe { text.color(RED) } else { text });
-                            });
+            .show_viewport(ui, |ui, viewport| {
+                ui.set_height(total);
+                let origin = ui.max_rect().min;
+                let width = ui.available_width();
+                let mut y = 0.0;
+                let mut resized = false;
+                for e in events {
+                    let h = height_of(e, heights);
+                    if y + h >= viewport.min.y && y <= viewport.max.y {
+                        let rect = egui::Rect::from_min_size(
+                            origin + egui::vec2(0.0, y),
+                            egui::vec2(width, h),
+                        );
+                        let mut row = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(rect)
+                                .layout(egui::Layout::top_down(egui::Align::Min)),
+                        );
+                        event_ui(&mut row, e);
+                        let actual = row.min_rect().height();
+                        if (actual - h).abs() > 0.5 {
+                            heights.insert(e.id, actual);
+                            resized = true;
                         }
-                        Some(incident) => incident_ui(ui, e.id, incident),
                     }
+                    y += h + gap;
+                }
+                // 高度跟估計的不一樣（例如剛展開事件）：再畫一次，位置才會對
+                if resized {
+                    ui.ctx().request_repaint();
                 }
             });
     }
 
     fn latest_incident(&self) -> Option<&Incident> {
-        self.events.iter().find_map(|e| e.incident.as_ref())
+        self.events.iter().find_map(|e| match &e.kind {
+            EntryKind::Incident(i) => Some(i),
+            EntryKind::Plain { .. } => None,
+        })
     }
 }
 
@@ -992,6 +991,19 @@ fn value_at(history: &VecDeque<(f64, Option<u32>)>, x: f64) -> Option<Option<u32
     history.iter().find(|(hx, _)| *hx == x).map(|&(_, ms)| ms)
 }
 
+fn event_ui(ui: &mut egui::Ui, e: &EventEntry) {
+    match &e.kind {
+        EntryKind::Plain { time, text, severe } => {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(time).monospace().color(GRAY));
+                let text = RichText::new(text);
+                ui.label(if *severe { text.color(RED) } else { text });
+            });
+        }
+        EntryKind::Incident(incident) => incident_ui(ui, e.id, incident),
+    }
+}
+
 /// 異常事件：標題列顯示時間、事件與診斷，展開後看各層數據和 traceroute
 fn incident_ui(ui: &mut egui::Ui, id: u64, incident: &Incident) {
     let header = format!("{}  ⚠ {}", incident.time, incident.title);
@@ -1013,10 +1025,12 @@ fn layer_state(r: &LayerReport) -> (Health, &'static str) {
         (None, _) if r.failed => (Health::Warn, "無法量測"),
         (None, _) => (Health::Unknown, "無目標"),
         (Some(None), _) => (Health::Bad, "逾時"),
-        (_, Some(s)) if s.loss_pct >= 5.0 => (Health::Bad, "掉包"),
-        (_, Some(s)) if s.loss_pct > 0.0 || s.jitter_ms.unwrap_or(0.0) > 30.0 => {
-            (Health::Warn, "不穩")
-        }
+        (_, Some(s)) => match Health::from_loss(s.loss_pct) {
+            Health::Bad => (Health::Bad, "掉包"),
+            Health::Warn => (Health::Warn, "不穩"),
+            _ if s.jitter_ms.unwrap_or(0.0) > 30.0 => (Health::Warn, "不穩"),
+            _ => (Health::Good, "正常"),
+        },
         _ => (Health::Good, "正常"),
     }
 }

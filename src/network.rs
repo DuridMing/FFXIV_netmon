@@ -44,7 +44,8 @@ pub struct NetworkWatcher {
     pub isp: Option<Ipv4Addr>,
     /// 最後一張有路由的網卡；斷線時用它查斷線原因
     last_if: Option<NetIf>,
-    down_reason: Option<String>,
+    /// 上一輪是否斷線中
+    was_down: bool,
     isp_retry_in: u32,
 }
 
@@ -57,7 +58,7 @@ impl NetworkWatcher {
             gateway,
             isp: find_isp_hop(gateway),
             last_if: route.and_then(|r| netif::interface(r.if_index)),
-            down_reason: None,
+            was_down: false,
             isp_retry_in: ISP_RETRY_ROUNDS,
         }
     }
@@ -82,7 +83,7 @@ impl NetworkWatcher {
         };
 
         let mut events = Vec::new();
-        let was_down = self.down_reason.is_some();
+        let was_down = self.was_down;
         let is_down = down_reason.is_some();
         if was_down && !is_down {
             let card = net_if
@@ -146,7 +147,7 @@ impl NetworkWatcher {
         {
             self.last_if = Some(n.clone());
         }
-        self.down_reason = down_reason.clone();
+        self.was_down = is_down;
         NetworkRound {
             net_if,
             down_reason,

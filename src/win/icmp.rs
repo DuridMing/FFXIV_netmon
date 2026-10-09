@@ -6,11 +6,10 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::IpHelper::{
-    ICMP_ECHO_REPLY, IP_OPTION_INFORMATION, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
+    ICMP_ECHO_REPLY, IP_OPTION_INFORMATION, IP_SUCCESS, IP_TTL_EXPIRED_TRANSIT, IcmpCloseHandle,
+    IcmpCreateFile, IcmpSendEcho,
 };
 
-const IP_SUCCESS: u32 = 0;
-const IP_TTL_EXPIRED_TRANSIT: u32 = 11013;
 const PAYLOAD: [u8; 32] = [0x61; 32];
 
 pub enum EchoResult {

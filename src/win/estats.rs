@@ -10,7 +10,7 @@ use windows::Win32::NetworkManagement::IpHelper::{
 
 use super::tcp_table::TcpConn;
 
-pub const ERROR_ACCESS_DENIED: u32 = 5;
+pub const ERROR_ACCESS_DENIED: u32 = windows::Win32::Foundation::ERROR_ACCESS_DENIED.0;
 
 /// 連線啟用收集以來的累計值；RTT 單位都是毫秒
 #[derive(Clone, Copy, Debug, Default)]

@@ -71,6 +71,16 @@ impl Window {
     }
 }
 
+/// 平均延遲之類的數值：「12.3 ms」，沒有資料時「-」
+pub fn fmt_ms(v: Option<f64>) -> String {
+    v.map_or("-".into(), |v| format!("{v:.1} ms"))
+}
+
+/// 單次量測結果：「12 ms」，逾時「逾時」
+pub fn fmt_rtt(rtt: Option<u32>) -> String {
+    rtt.map_or("逾時".into(), |ms| format!("{ms} ms"))
+}
+
 fn summarize(recent: Vec<Option<u32>>) -> Option<Summary> {
     if recent.is_empty() {
         return None;

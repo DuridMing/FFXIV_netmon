@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
-use crate::detector::{self, GameEvent, GameSnapshot, GameTracker};
+use crate::detector::{GameEvent, GameScanner, GameSnapshot, GameTracker};
 use crate::diagnosis::{self, LayerState};
-use crate::events::{EventDetector, IncidentKind, RECENT};
+use crate::events::{EventDetector, IncidentKind, RECENT, RECENT_SECS};
 use crate::game_tcp::{GameTcpReport, GameTcpTracker, TcpStatus};
-use crate::hops::{HopReport, HopTracker};
+use crate::hops::{self, HopReport, HopTracker};
 use crate::network::NetworkWatcher;
-use crate::stats::{Summary, Window};
+use crate::stats::{Summary, Window, fmt_ms, fmt_rtt};
 use crate::storage::{self, IncidentRecord, RoundRecord, Sample, Storage};
 use crate::trace::{self, Trace};
 use crate::wifi::{WifiStatus, WifiWatcher};
@@ -23,11 +23,13 @@ use crate::win::netif::{IfKind, NetIf};
 use crate::win::time;
 
 pub const INTERVAL: Duration = Duration::from_secs(2);
-const TIMEOUT: Duration = Duration::from_millis(1000);
+/// 每次量測（ping、TCP 連線、traceroute 每一跳）最多等多久
+pub const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 pub const INTERNET_TARGET: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
-/// 統計視窗：30 次 × 2 秒 = 60 秒
+/// 統計視窗：30 次 × 2 秒 = 60 秒（各層、中間節點、遊戲連線 TCP 統計共用）
 pub const WINDOW_SIZE: usize = 30;
-const GAME_TRACE_HOPS: u8 = 20;
+/// 統計視窗的秒數，顯示「近 N 秒」用
+pub const WINDOW_SECS: u64 = WINDOW_SIZE as u64 * INTERVAL.as_secs();
 /// 讀不到遊戲連線表時，最多沿用上一輪的結果幾次（3 × 2 秒 = 6 秒），之後才當作遊戲沒有連線
 const MAX_SCAN_FAILURES: u32 = 3;
 /// 每幾輪寫一次記錄檔（30 × 2 秒 = 1 分鐘）；發生異常事件時立刻寫
@@ -39,8 +41,12 @@ const PRUNE_ROUNDS: usize = 1800;
 /// 結束程式時，最多等背景執行緒多久（寫入記錄檔、或正在做事件的 traceroute）
 const STOP_WAIT: Duration = Duration::from_secs(3);
 
+/// 各層的名稱與索引（索引也是記錄檔裡 samples.layer 的值，改順序要遷移資料庫）
 pub const LAYER_NAMES: [&str; 4] = ["路由器", "ISP", "外部網路", "遊戲伺服器"];
-const GAME: usize = 3;
+pub const GATEWAY: usize = 0;
+pub const ISP: usize = 1;
+pub const INTERNET: usize = 2;
+pub const GAME: usize = 3;
 
 pub enum GameStatus {
     NotRunning,
@@ -59,29 +65,32 @@ pub struct LayerReport {
     pub summary: Option<Summary>,
 }
 
+/// 每一輪的量測結果
+pub struct Round {
+    /// 從監測開始經過的秒數，給圖表當 X 軸
+    pub elapsed: f64,
+    pub wifi: WifiStatus,
+    pub game: GameStatus,
+    pub layers: Vec<LayerReport>,
+    /// 遊戲連線的 TCP 統計
+    pub tcp: TcpStatus,
+    /// 中間節點追蹤的目標與各跳狀態；沒有遊戲目標時是空的
+    pub hop_target: Option<Ipv4Addr>,
+    pub hops: Vec<HopReport>,
+    /// 持續掉包的起點：(跳數, 位址)
+    pub hop_loss_origin: Option<(u8, Option<Ipv4Addr>)>,
+    /// 目前上網用的網卡；網路中斷時是最後一張用過的網卡
+    pub net_if: Option<NetIf>,
+    /// 電腦網路斷線的原因；None 代表網路正常
+    pub network_down: Option<String>,
+    /// 記錄檔寫入失敗的原因；None 代表正常
+    pub storage_error: Option<String>,
+}
+
 pub enum MonitorMsg {
     /// 啟動進度
     Status(String),
-    Round {
-        /// 從監測開始經過的秒數，給圖表當 X 軸
-        elapsed: f64,
-        wifi: WifiStatus,
-        game: GameStatus,
-        layers: Vec<LayerReport>,
-        /// 遊戲連線的 TCP 統計
-        tcp: TcpStatus,
-        /// 中間節點追蹤的目標與各跳狀態；沒有遊戲目標時是空的
-        hop_target: Option<Ipv4Addr>,
-        hops: Vec<HopReport>,
-        /// 持續掉包的起點：(跳數, 位址)
-        hop_loss_origin: Option<(u8, Option<Ipv4Addr>)>,
-        /// 目前上網用的網卡；網路中斷時是最後一張用過的網卡
-        net_if: Option<NetIf>,
-        /// 電腦網路斷線的原因；None 代表網路正常
-        network_down: Option<String>,
-        /// 記錄檔寫入失敗的原因；None 代表正常
-        storage_error: Option<String>,
-    },
+    Round(Round),
     Event {
         time: String,
         text: String,
@@ -144,7 +153,7 @@ impl Probe {
     fn run(self) -> Measured {
         match self {
             Probe::Icmp(ip) => match Icmp::new() {
-                Ok(icmp) => match icmp.echo(ip, None, TIMEOUT) {
+                Ok(icmp) => match icmp.echo(ip, None, PROBE_TIMEOUT) {
                     EchoResult::Reply { rtt_ms } => Measured::Rtt(rtt_ms),
                     _ => Measured::Lost,
                 },
@@ -153,7 +162,7 @@ impl Probe {
             Probe::Tcp(addr) => {
                 let start = Instant::now();
                 // 只做 handshake，連上後立刻關閉，不送任何資料
-                match TcpStream::connect_timeout(&addr.into(), TIMEOUT) {
+                match TcpStream::connect_timeout(&addr.into(), PROBE_TIMEOUT) {
                     Ok(_) => Measured::Rtt(start.elapsed().as_millis() as u32),
                     Err(e) if is_local_error(&e) => Measured::Failed,
                     Err(_) => Measured::Lost,
@@ -390,6 +399,7 @@ fn run(
     }
 
     let started = Instant::now();
+    let mut scanner = GameScanner::default();
     let mut tracker = GameTracker::default();
     let mut detector = EventDetector::default();
     // 斷線後連線表裡就沒有伺服器了，traceroute 要用最後一次看到的位址
@@ -410,7 +420,7 @@ fn run(
         let mut game_disconnected = false;
         let mut game_conn = None;
         if manual_target.is_none() {
-            let snapshot = match detector::scan() {
+            let snapshot = match scanner.scan() {
                 Some(s) => {
                     scan_failures = 0;
                     last_snapshot = s.clone();
@@ -459,7 +469,7 @@ fn run(
             hop_records.push((old.to_string(), agg));
         }
 
-        // 各層和中間節點同時量測，一輪最多花 TIMEOUT 的時間
+        // 各層和中間節點同時量測，一輪最多花 PROBE_TIMEOUT 的時間
         let hop_probe = hop_tracker.target().map(|t| (t, hop_tracker.probe_hops()));
         let (results, hop_trace): (Vec<Option<Measured>>, Option<Trace>) = thread::scope(|s| {
             let hop_handle = hop_probe.map(|(t, n)| s.spawn(move || trace::traceroute(t, n)));
@@ -518,8 +528,8 @@ fn run(
             }
         }
         if net.targets_changed {
-            layers[0].set_probe(network.gateway.map(Probe::Icmp));
-            layers[1].set_probe(network.isp.map(Probe::Icmp));
+            layers[GATEWAY].set_probe(network.gateway.map(Probe::Icmp));
+            layers[ISP].set_probe(network.isp.map(Probe::Icmp));
         }
 
         let wifi = wifi_watcher.update(net.net_if.as_ref());
@@ -530,13 +540,13 @@ fn run(
         }
         last_wifi = wifi.clone();
 
-        let windows = [0, 1, 2, 3].map(|i| &layers[i].window);
+        let windows = layers.each_ref().map(|l| &l.window);
         let hop_reports = hop_tracker.reports();
         let hop_loss_origin = hop_tracker.loss_origin();
         let kind = detector.check(windows, game_disconnected, net.signal, tcp_report.as_ref());
         let mut incident_record = None;
         if let Some(kind) = kind {
-            let mut states = [0, 1, 2, 3].map(|i| layers[i].state());
+            let mut states = layers.each_ref().map(Layer::state);
             let mut targets = targets.clone();
             let mut extra = IncidentExtra {
                 net_if: net.net_if.as_ref(),
@@ -545,6 +555,9 @@ fn run(
                 tcp: tcp_report,
                 hops: &hop_reports,
                 hop_loss_origin,
+                trace: hop_trace
+                    .as_ref()
+                    .filter(|_| hop_tracker.target() == last_game_target.map(|t| *t.ip())),
             };
             // 遊戲斷線（或同一輪的網路中斷）：遊戲層和中間節點用斷線前的狀態
             if let Some(d) = disconnect.as_ref().filter(|_| {
@@ -613,7 +626,7 @@ fn run(
             (None, None) => GameStatus::NotRunning,
         };
 
-        if !send(MonitorMsg::Round {
+        if !send(MonitorMsg::Round(Round {
             elapsed: started.elapsed().as_secs_f64(),
             wifi,
             game,
@@ -625,7 +638,7 @@ fn run(
             net_if: net.net_if,
             network_down: net.down_reason,
             storage_error: recorder.error.clone(),
-        }) {
+        })) {
             return;
         }
 
@@ -676,6 +689,8 @@ struct IncidentExtra<'a> {
     tcp: Option<GameTcpReport>,
     hops: &'a [HopReport],
     hop_loss_origin: Option<(u8, Option<Ipv4Addr>)>,
+    /// 這一輪中間節點追蹤到遊戲伺服器的 traceroute；有的話事件直接用，不再另外追蹤一次
+    trace: Option<&'a Trace>,
 }
 
 fn build_incident(
@@ -694,9 +709,16 @@ fn build_incident(
             | IncidentKind::GameRetransmits
             | IncidentKind::GameRtoTimeout
     );
-    let trace = game_target
-        .filter(|_| involves_game)
-        .map(|t| trace::traceroute(*t.ip(), GAME_TRACE_HOPS));
+    // 斷線時中間節點追蹤已經停了，才需要另外追蹤一次
+    let fresh_trace;
+    let trace = match (involves_game, extra.trace) {
+        (false, _) => None,
+        (true, Some(t)) => Some(t),
+        (true, None) => {
+            fresh_trace = game_target.map(|t| trace::traceroute(*t.ip(), hops::MAX_HOPS));
+            fresh_trace.as_ref()
+        }
+    };
 
     let mut details: Vec<String> = states
         .iter()
@@ -714,26 +736,26 @@ fn build_incident(
     }
     if let Some(t) = &extra.tcp {
         details.push(format!(
-            "遊戲連線 TCP：實際延遲 {} ms（變動 {} ms），近 20 秒重傳 {} 個封包、逾時 {} 次，近 60 秒重傳 {} 個、逾時 {} 次",
+            "遊戲連線 TCP：實際延遲 {} ms（變動 {} ms），近 {RECENT_SECS} 秒重傳 {} 個封包、逾時 {} 次，近 {WINDOW_SECS} 秒重傳 {} 個、逾時 {} 次",
             t.smoothed_rtt_ms,
             t.rtt_var_ms,
             t.retrans_recent,
             t.timeouts_recent,
-            t.retrans_60s,
-            t.timeouts_60s
+            t.retrans_window,
+            t.timeouts_window
         ));
     }
     if !extra.hops.is_empty() {
-        details.push("中間節點（近 60 秒）：".into());
+        details.push(format!("中間節點（近 {WINDOW_SECS} 秒）："));
         details.extend(hop_lines(extra.hops));
     }
-    if let (Some(t), Some(target)) = (&trace, game_target) {
+    if let (Some(t), Some(target)) = (trace, game_target) {
         details.push(format!("traceroute 到 {}：", target.ip()));
         details.extend(trace_lines(t));
     }
 
     let ctx = diagnosis::Context {
-        trace: trace.as_ref(),
+        trace,
         wifi_quality: extra.wifi.info().map(|w| w.quality),
         hop_loss_origin: extra.hop_loss_origin,
         net_if: extra.net_if,
@@ -767,15 +789,11 @@ fn layer_detail(i: usize, s: &LayerState, target: Option<String>) -> String {
         return format!("{name}：沒有目標");
     }
     let target = target.map(|t| format!("（{t}）")).unwrap_or_default();
-    let last = match s.last {
-        Some(Some(ms)) => format!("{ms} ms"),
-        Some(None) => "逾時".into(),
-        None => "-".into(),
-    };
+    let last = s.last.map_or("-".into(), fmt_rtt);
     match s.recent {
         Some(r) => format!(
-            "{name}{target}：最近一次 {last}，近 20 秒平均 {}、掉包 {:.0}%",
-            r.avg_ms.map_or("-".into(), |v| format!("{v:.1} ms")),
+            "{name}{target}：最近一次 {last}，近 {RECENT_SECS} 秒平均 {}、掉包 {:.0}%",
+            fmt_ms(r.avg_ms),
             r.loss_pct
         ),
         None => format!("{name}{target}：最近一次 {last}"),
@@ -790,7 +808,7 @@ fn hop_lines(hops: &[HopReport]) -> Vec<String> {
                 Some(s) => format!(
                     "  {:>2}  {addr}  平均 {}、掉包 {:.0}%",
                     h.ttl,
-                    s.avg_ms.map_or("-".into(), |v| format!("{v:.1} ms")),
+                    fmt_ms(s.avg_ms),
                     s.loss_pct
                 ),
                 None => format!("  {:>2}  {addr}", h.ttl),

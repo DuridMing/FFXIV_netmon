@@ -12,8 +12,11 @@ use std::sync::OnceLock;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::VERSION;
-use crate::monitor::LAYER_NAMES;
+use crate::icon::{BAD_LOSS_PCT, Health};
+use crate::monitor::{GAME, LAYER_NAMES};
+use crate::stats::fmt_ms;
 use crate::storage;
+use crate::wifi::WEAK_WIFI;
 use crate::win::{shell, time};
 
 /// 可以選的報告範圍（小時）
@@ -24,7 +27,6 @@ pub const RANGES: [(u32, &str); 3] = [
 ];
 /// 超過這個範圍就改用每日彙總
 const DETAIL_HOURS: u32 = 24;
-const GAME_LAYER: i64 = 3;
 /// 中間節點摘要最多列出幾個目標（遊戲換伺服器時會有多個）
 const MAX_HOP_TARGETS: usize = 3;
 const WEEKDAYS: [&str; 7] = ["日", "一", "二", "三", "四", "五", "六"];
@@ -285,13 +287,7 @@ fn write_layer_stats(h: &mut String, layers: &[LayerStat]) {
 }
 
 fn write_tcp_summary(h: &mut String, t: &TcpSummary) {
-    let class = if t.timeouts > 0 {
-        "bad"
-    } else if t.retrans > 0 {
-        "warn"
-    } else {
-        ""
-    };
+    let class = Health::from_tcp(t.retrans, t.timeouts).css_class();
     let _ = write!(
         h,
         "<h2>遊戲連線 TCP 統計</h2>\
@@ -305,7 +301,7 @@ fn write_tcp_summary(h: &mut String, t: &TcpSummary) {
         t.avg_rtt,
         t.max_rtt,
         t.retrans,
-        if t.timeouts > 0 { "bad" } else { "" },
+        Health::from_tcp(0, t.timeouts).css_class(),
         t.timeouts
     );
 }
@@ -342,7 +338,7 @@ fn write_heatmap(h: &mut String, conn: &Connection, since: i64) -> rusqlite::Res
                 COUNT(*), SUM(rtt_ms IS NULL)
          FROM samples WHERE ts_ms >= ?1 AND layer = ?2 GROUP BY 1, 2",
     )?;
-    let rows = stmt.query_map([since, GAME_LAYER], |r| {
+    let rows = stmt.query_map([since, GAME as i64], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,
@@ -405,7 +401,7 @@ fn write_buckets(h: &mut String, buckets: &BTreeMap<String, Bucket>, detailed: b
     };
     let _ = write!(
         h,
-        "<h2>{title}</h2><p class=meta>延遲欄位是平均延遲／掉包率。黃色代表有掉包，紅色代表掉包率 5% 以上。</p>\
+        "<h2>{title}</h2><p class=meta>延遲欄位是平均延遲／掉包率。黃色代表有掉包，紅色代表掉包率 {BAD_LOSS_PCT}% 以上。</p>\
          <div class=scroll><table><thead><tr><th>{first_col}</th>"
     );
     for name in LAYER_NAMES {
@@ -446,13 +442,7 @@ fn write_buckets(h: &mut String, buckets: &BTreeMap<String, Bucket>, detailed: b
         if has_tcp {
             match b.tcp {
                 Some((retrans, timeouts)) => {
-                    let class = if timeouts > 0 {
-                        "bad"
-                    } else if retrans > 0 {
-                        "warn"
-                    } else {
-                        ""
-                    };
+                    let class = Health::from_tcp(retrans, timeouts).css_class();
                     let _ = write!(h, "<td class='num {class}'>{retrans}／{timeouts}</td>");
                 }
                 None => {
@@ -463,7 +453,7 @@ fn write_buckets(h: &mut String, buckets: &BTreeMap<String, Bucket>, detailed: b
         if has_wifi {
             match b.wifi {
                 Some((avg, min)) => {
-                    let class = if min < 50 { "warn" } else { "" };
+                    let class = if min < WEAK_WIFI as i64 { "warn" } else { "" };
                     let _ = write!(
                         h,
                         "<td class='num {class}'>平均 {avg:.0}%（最低 {min}%）</td>"
@@ -717,17 +707,7 @@ fn pct(part: i64, total: i64) -> f64 {
 }
 
 fn loss_class(loss: f64) -> &'static str {
-    if loss >= 5.0 {
-        "bad"
-    } else if loss > 0.0 {
-        "warn"
-    } else {
-        ""
-    }
-}
-
-fn fmt_ms(v: Option<f64>) -> String {
-    v.map_or("-".into(), |v| format!("{v:.1} ms"))
+    Health::from_loss(loss).css_class()
 }
 
 fn esc(s: &str) -> String {

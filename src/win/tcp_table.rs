@@ -10,7 +10,8 @@ use windows::Win32::NetworkManagement::IpHelper::{
 };
 use windows::Win32::Networking::WinSock::AF_INET;
 
-pub const STATE_ESTABLISHED: u32 = 5;
+pub const STATE_ESTABLISHED: u32 =
+    windows::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_ESTAB.0 as u32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TcpConn {
