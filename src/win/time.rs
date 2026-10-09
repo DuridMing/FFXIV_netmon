@@ -16,3 +16,9 @@ pub fn now_stamp() -> String {
         t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
     )
 }
+
+/// 今天從午夜到現在經過的秒數（本地時間）
+pub fn now_secs_of_day() -> i64 {
+    let t = unsafe { GetLocalTime() };
+    t.wHour as i64 * 3600 + t.wMinute as i64 * 60 + t.wSecond as i64
+}

@@ -2,6 +2,7 @@
 
 use std::net::SocketAddrV4;
 
+use crate::win::tcp_table::TcpConn;
 use crate::win::{process, tcp_table};
 
 pub const GAME_PROCESSES: &[&str] = &["ffxiv_dx11.exe"];
@@ -10,29 +11,38 @@ pub struct GameSnapshot {
     pub running: bool,
     /// 遊戲目前已建立（ESTABLISHED）的遠端連線
     pub remotes: Vec<SocketAddrV4>,
+    /// 同上，但包含本機端位址；讀 TCP 統計時要用完整的連線
+    pub conns: Vec<TcpConn>,
+}
+
+impl GameSnapshot {
+    pub fn conn_to(&self, remote: SocketAddrV4) -> Option<TcpConn> {
+        self.conns.iter().find(|c| c.remote == remote).copied()
+    }
 }
 
 pub fn scan() -> GameSnapshot {
     let pids = process::find_pids(GAME_PROCESSES);
-    let mut remotes = Vec::new();
+    let mut conns = Vec::new();
     if !pids.is_empty()
-        && let Ok(conns) = tcp_table::tcp_connections()
+        && let Ok(all) = tcp_table::tcp_connections()
     {
-        remotes = conns
+        conns = all
             .into_iter()
             .filter(|c| {
                 pids.contains(&c.pid)
                     && c.state == tcp_table::STATE_ESTABLISHED
                     && !c.remote.ip().is_loopback()
             })
-            .map(|c| c.remote)
             .collect();
-        remotes.sort();
-        remotes.dedup();
     }
+    let mut remotes: Vec<SocketAddrV4> = conns.iter().map(|c| c.remote).collect();
+    remotes.sort();
+    remotes.dedup();
     GameSnapshot {
         running: !pids.is_empty(),
         remotes,
+        conns,
     }
 }
 

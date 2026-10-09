@@ -5,6 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 
+use crate::game_tcp::GameTcpReport;
+use crate::hops::HopAggregate;
 use crate::win::wlan::WifiInfo;
 
 /// 樣本保留天數
@@ -46,6 +48,8 @@ fn clear_db(path: &std::path::Path) -> Result<(), String> {
     conn.execute_batch(
         "BEGIN;
          DELETE FROM samples;
+         DELETE FROM tcp_stats;
+         DELETE FROM hop_stats;
          DELETE FROM wifi_samples;
          DELETE FROM incidents;
          COMMIT;",
@@ -86,6 +90,25 @@ impl Storage {
                  quality INTEGER NOT NULL  -- 訊號品質 0–100
              );
              CREATE INDEX IF NOT EXISTS wifi_samples_ts ON wifi_samples (ts_ms);
+             CREATE TABLE IF NOT EXISTS tcp_stats (
+                 ts_ms           INTEGER NOT NULL,
+                 remote          TEXT    NOT NULL,
+                 smoothed_rtt_ms INTEGER NOT NULL,
+                 rtt_var_ms      INTEGER NOT NULL,
+                 retrans         INTEGER NOT NULL,  -- 這一輪新增的重傳封包數
+                 timeouts        INTEGER NOT NULL   -- 這一輪新增的 RTO 逾時次數
+             );
+             CREATE INDEX IF NOT EXISTS tcp_stats_ts ON tcp_stats (ts_ms);
+             CREATE TABLE IF NOT EXISTS hop_stats (   -- 中間節點每分鐘彙總
+                 ts_ms  INTEGER NOT NULL,
+                 target TEXT    NOT NULL,
+                 ttl    INTEGER NOT NULL,
+                 addr   TEXT,                       -- NULL 代表這一跳從沒回應
+                 count  INTEGER NOT NULL,
+                 lost   INTEGER NOT NULL,
+                 avg_ms REAL
+             );
+             CREATE INDEX IF NOT EXISTS hop_stats_ts ON hop_stats (ts_ms);
              CREATE TABLE IF NOT EXISTS incidents (
                  id        INTEGER PRIMARY KEY,
                  ts_ms     INTEGER NOT NULL,
@@ -98,7 +121,7 @@ impl Storage {
         .map_err(|e| e.to_string())?;
 
         let cutoff = now_ms() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
-        for table in ["samples", "wifi_samples"] {
+        for table in ["samples", "wifi_samples", "tcp_stats", "hop_stats"] {
             conn.execute(&format!("DELETE FROM {table} WHERE ts_ms < ?1"), [cutoff])
                 .map_err(|e| e.to_string())?;
         }
@@ -125,6 +148,43 @@ impl Storage {
                 "INSERT INTO wifi_samples (ts_ms, ssid, quality) VALUES (?1, ?2, ?3)",
                 params![ts_ms, w.ssid, w.quality],
             )?;
+        }
+        tx.commit()
+    }
+
+    pub fn record_tcp(&self, ts_ms: i64, remote: &str, r: &GameTcpReport) -> rusqlite::Result<()> {
+        self.conn
+            .prepare_cached(
+                "INSERT INTO tcp_stats (ts_ms, remote, smoothed_rtt_ms, rtt_var_ms, retrans, timeouts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?
+            .execute(params![ts_ms, remote, r.smoothed_rtt_ms, r.rtt_var_ms, r.retrans, r.timeouts])?;
+        Ok(())
+    }
+
+    pub fn record_hops(
+        &mut self,
+        ts_ms: i64,
+        target: &str,
+        hops: &[HopAggregate],
+    ) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO hop_stats (ts_ms, target, ttl, addr, count, lost, avg_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for h in hops {
+                stmt.execute(params![
+                    ts_ms,
+                    target,
+                    h.ttl,
+                    h.addr.map(|a| a.to_string()),
+                    h.count,
+                    h.lost,
+                    h.avg_ms
+                ])?;
+            }
         }
         tx.commit()
     }

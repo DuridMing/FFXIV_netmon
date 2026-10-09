@@ -6,25 +6,37 @@ use std::thread;
 
 use crossbeam_channel::Receiver;
 use eframe::egui::{self, Color32, RichText};
-use egui_plot::{Legend, Line, Plot, PlotPoints, Points, VLine};
+use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoints, Points, VLine};
 
+use crate::game_tcp::TcpStatus;
+use crate::hops::HopReport;
 use crate::icon::Health;
 use crate::monitor::{GameStatus, Incident, LAYER_NAMES, LayerReport, MonitorMsg, WINDOW_SIZE};
 use crate::report::{self, Exported};
 use crate::settings::{CloseAction, Settings};
 use crate::storage;
-use crate::win::time;
 use crate::win::tray::{Tray, TrayCommand};
 use crate::win::wlan::WifiInfo;
+use crate::win::{elevation, time};
 
 /// 圖表保留的量測次數：300 × 2 秒 = 10 分鐘
 const HISTORY: usize = 300;
+/// 圖表 X 軸顯示的時間長度（秒）
+const CHART_SPAN_SECS: f64 = 600.0;
+/// 圖表 Y 軸至少顯示到這個值，延遲很低時線才不會貼滿整張圖
+const CHART_MIN_Y_MS: f64 = 10.0;
 const MAX_EVENTS: usize = 500;
 const GAME_LAYER: usize = 3;
 const FONT_PATH: &str = r"C:\Windows\Fonts\msjh.ttc";
-const REPORT_HOURS: u32 = 24;
 /// 低於這個 Wi-Fi 訊號就用黃色提醒
 const WEAK_WIFI: u32 = 50;
+
+/// 主畫面下半部的分頁
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Chart,
+    Hops,
+}
 
 const GRAY: Color32 = rgb(Health::Unknown);
 const YELLOW: Color32 = rgb(Health::Warn);
@@ -58,10 +70,17 @@ pub struct App {
     game: Option<GameStatus>,
     layers: Vec<LayerReport>,
     wifi: Option<WifiInfo>,
+    tcp: Option<TcpStatus>,
+    hop_target: Option<std::net::Ipv4Addr>,
+    hops: Vec<HopReport>,
+    hop_loss_origin: Option<(u8, Option<std::net::Ipv4Addr>)>,
+    tab: Tab,
     /// 每層的 (經過秒數, 延遲)；延遲 None 代表逾時
     history: [VecDeque<(f64, Option<u32>)>; 4],
     /// 每一輪的 (經過秒數, 量測時間)，給圖表的滑鼠提示用
     round_times: VecDeque<(f64, String)>,
+    /// 監測開始（經過秒數 0）時是一天中的第幾秒，用來把 X 軸換成實際時間
+    clock_base_secs: Option<i64>,
     /// 最新的在最前面
     events: VecDeque<EventEntry>,
     next_event_id: u64,
@@ -93,8 +112,14 @@ impl App {
             game: None,
             layers: Vec::new(),
             wifi: None,
+            tcp: None,
+            hop_target: None,
+            hops: Vec::new(),
+            hop_loss_origin: None,
+            tab: Tab::Chart,
             history: Default::default(),
             round_times: VecDeque::new(),
+            clock_base_secs: None,
             events: VecDeque::new(),
             next_event_id: 0,
             tray,
@@ -157,7 +182,15 @@ impl App {
                     wifi,
                     game,
                     layers,
+                    tcp,
+                    hop_target,
+                    hops,
+                    hop_loss_origin,
                 } => {
+                    self.tcp = Some(tcp);
+                    self.hop_target = hop_target;
+                    self.hops = hops;
+                    self.hop_loss_origin = hop_loss_origin;
                     for (history, report) in self.history.iter_mut().zip(&layers) {
                         match report.last {
                             Some(r) => history.push_back((elapsed, r)),
@@ -168,6 +201,8 @@ impl App {
                             history.pop_front();
                         }
                     }
+                    self.clock_base_secs
+                        .get_or_insert_with(|| time::now_secs_of_day() - elapsed.round() as i64);
                     self.round_times.push_back((elapsed, time::now_hms()));
                     if self.round_times.len() > HISTORY {
                         self.round_times.pop_front();
@@ -246,11 +281,11 @@ impl App {
         }
     }
 
-    fn start_export(&mut self, ctx: &egui::Context) {
+    fn start_export(&mut self, ctx: &egui::Context, hours: u32) {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let _ = tx.send(report::export(REPORT_HOURS));
+            let _ = tx.send(report::export(hours));
             ctx.request_repaint();
         });
         self.export_rx = Some(rx);
@@ -401,20 +436,22 @@ impl App {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let exporting = self.export_rx.is_some();
-                let label = if exporting {
-                    "匯出中..."
+                if self.export_rx.is_some() {
+                    ui.add_enabled(false, egui::Button::new("匯出中..."));
                 } else {
-                    "匯出報告"
-                };
-                if ui
-                    .add_enabled(!exporting, egui::Button::new(label))
-                    .on_hover_text(format!(
-                        "匯出最近 {REPORT_HOURS} 小時的 HTML 報告和 CSV 到「文件\\ff14-netmon」"
-                    ))
-                    .clicked()
-                {
-                    self.start_export(ui.ctx());
+                    ui.menu_button("匯出報告", |ui| {
+                        ui.label(
+                            RichText::new("HTML 報告和 CSV 會存到「文件\\ff14-netmon」")
+                                .small()
+                                .color(GRAY),
+                        );
+                        for (hours, label) in report::RANGES {
+                            if ui.button(label).clicked() {
+                                self.start_export(ui.ctx(), hours);
+                                ui.close();
+                            }
+                        }
+                    });
                 }
                 ui.menu_button("設定", |ui| self.settings_menu(ui));
             });
@@ -441,6 +478,144 @@ impl App {
                     .color(YELLOW),
             );
         }
+    }
+
+    /// 遊戲連線本身的 TCP 統計（需要系統管理員權限）
+    fn tcp_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("遊戲連線（TCP）").strong().color(LAYER_COLORS[GAME_LAYER]));
+            match self.tcp {
+                None | Some(TcpStatus::NoConnection) => {
+                    ui.label(RichText::new("沒有遊戲連線").color(GRAY));
+                }
+                Some(TcpStatus::NotElevated) => {
+                    ui.label(
+                        RichText::new("實際延遲和重傳統計需要系統管理員權限").color(GRAY),
+                    );
+                    if ui
+                        .button("以系統管理員身分重新啟動")
+                        .on_hover_text("會跳出 Windows 的權限確認視窗，按「是」後程式會重新開啟")
+                        .clicked()
+                    {
+                        self.restart_as_admin(ui.ctx());
+                    }
+                }
+                Some(TcpStatus::Error(code)) => {
+                    ui.label(
+                        RichText::new(format!("無法讀取遊戲連線統計（Windows 錯誤碼 {code}）"))
+                            .color(YELLOW),
+                    );
+                }
+                Some(TcpStatus::Stats(t)) => {
+                    ui.label(format!("實際延遲 {} ms（變動 ±{} ms）", t.smoothed_rtt_ms, t.rtt_var_ms));
+                    ui.separator();
+                    let color = if t.timeouts_60s > 0 {
+                        RED
+                    } else if t.retrans_60s > 0 {
+                        YELLOW
+                    } else {
+                        GRAY
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "近 60 秒重傳 {} 個封包、逾時 {} 次",
+                            t.retrans_60s, t.timeouts_60s
+                        ))
+                        .color(color),
+                    )
+                    .on_hover_text(
+                        "重傳：封包送出後沒收到確認，系統重送。逾時：等太久都沒回應，連續發生會導致 90002 斷線。",
+                    );
+                }
+            }
+        });
+    }
+
+    fn restart_as_admin(&mut self, ctx: &egui::Context) {
+        if elevation::restart_as_admin() {
+            // 新的程式已經用系統管理員身分啟動，這個直接結束
+            self.quitting = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            self.push_event(
+                time::now_hms(),
+                "已取消以系統管理員身分重新啟動".into(),
+                false,
+            );
+        }
+    }
+
+    /// 中間節點追蹤（類似 MTR）
+    fn hops_ui(&self, ui: &mut egui::Ui) {
+        let Some(target) = self.hop_target else {
+            ui.label(RichText::new("連上遊戲伺服器後，會開始追蹤路徑上的每一個節點。").color(GRAY));
+            return;
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("到 {target} 的路徑（近 60 秒）"));
+            match self.hop_loss_origin {
+                Some((ttl, addr)) => {
+                    let addr = addr.map(|a| format!("（{a}）")).unwrap_or_default();
+                    ui.label(RichText::new(format!("從第 {ttl} 跳{addr}開始持續掉包")).color(RED));
+                }
+                None => {
+                    ui.label(RichText::new("沒有持續掉包的節點").color(GRAY));
+                }
+            }
+        });
+        ui.label(
+            RichText::new(
+                "只有某一跳掉包、後面的節點都正常時，通常是那台路由器限制回應，不代表真的掉包。",
+            )
+            .small()
+            .color(GRAY),
+        );
+        if self.hops.is_empty() {
+            ui.label(RichText::new("追蹤中...").color(GRAY));
+            return;
+        }
+
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                egui::Grid::new("hops")
+                    .striped(true)
+                    .num_columns(5)
+                    .spacing([24.0, 4.0])
+                    .show(ui, |ui| {
+                        for h in ["跳數", "節點", "延遲", "平均", "掉包率"] {
+                            ui.label(RichText::new(h).strong());
+                        }
+                        ui.end_row();
+
+                        let origin = self.hop_loss_origin.map(|(ttl, _)| ttl);
+                        for h in &self.hops {
+                            let in_lossy_part = origin.is_some_and(|o| h.ttl >= o);
+                            let ttl = RichText::new(h.ttl.to_string());
+                            ui.label(if in_lossy_part { ttl.color(RED) } else { ttl });
+                            ui.label(
+                                h.addr
+                                    .map_or("*（沒有回應）".to_string(), |a| a.to_string()),
+                            );
+                            ui.label(h.last.map_or("逾時".to_string(), |ms| format!("{ms} ms")));
+                            ui.label(
+                                h.summary
+                                    .and_then(|s| s.avg_ms)
+                                    .map_or("-".to_string(), |v| format!("{v:.1} ms")),
+                            );
+                            let loss = h.summary.map_or(0.0, |s| s.loss_pct);
+                            let color = if in_lossy_part {
+                                RED
+                            } else if loss > 0.0 {
+                                YELLOW
+                            } else {
+                                GRAY
+                            };
+                            ui.label(RichText::new(format!("{loss:.0}%")).color(color));
+                            ui.end_row();
+                        }
+                    });
+            });
     }
 
     fn table_ui(&self, ui: &mut egui::Ui) {
@@ -492,22 +667,47 @@ impl App {
             .map(|&(x, _)| [x, 0.0])
             .collect();
 
+        // 顯示範圍每一幀都自己算：最近 10 分鐘、Y 軸從 0 到最大值再留一點空間。
+        // 交給圖表自動縮放的話，遊戲重開清掉資料後範圍會卡住，線會跑出畫面外。
+        let bounds = self.round_times.back().map(|&(x_max, _)| {
+            let x_min = self
+                .round_times
+                .front()
+                .map_or(x_max, |&(x, _)| x)
+                .max(x_max - CHART_SPAN_SECS);
+            let y_max = self
+                .history
+                .iter()
+                .flatten()
+                .filter(|(x, _)| *x >= x_min)
+                .filter_map(|&(_, ms)| ms)
+                .max()
+                .map_or(CHART_MIN_Y_MS, |ms| (ms as f64 * 1.15).max(CHART_MIN_Y_MS));
+            // 剛啟動只有一筆資料時，X 範圍不能是 0
+            PlotBounds::from_min_max([x_min.min(x_max - 10.0), 0.0], [x_max, y_max])
+        });
+        let clock_base = self.clock_base_secs.unwrap_or(0);
+
         let response = Plot::new("latency")
             .legend(Legend::default())
-            .include_y(0.0)
             .allow_drag(false)
             .allow_zoom(false)
             .allow_scroll(false)
             .allow_boxed_zoom(false)
+            .allow_double_click_reset(false)
+            .allow_axis_zoom_drag(false)
             .y_axis_label("ms")
-            .x_axis_formatter(|mark, _| {
-                let s = mark.value.max(0.0) as u64;
-                format!("{}:{:02}", s / 60, s % 60)
+            .x_axis_formatter(move |mark, _| {
+                let s = (clock_base + mark.value.round() as i64).rem_euclid(24 * 3600);
+                format!("{:02}:{:02}", s / 3600, s % 3600 / 60)
             })
             // 預設的座標提示沒有意義（X 軸是經過秒數），改用下面的數值提示
             .show_x(false)
             .show_y(false)
             .show(ui, |plot| {
+                if let Some(b) = bounds {
+                    plot.set_plot_bounds(b);
+                }
                 for (i, history) in self.history.iter().enumerate() {
                     let points: PlotPoints = history
                         .iter()
@@ -624,8 +824,17 @@ impl eframe::App for App {
             .show(ui, |ui| self.events_ui(ui));
         egui::CentralPanel::default_margins().show(ui, |ui| {
             self.table_ui(ui);
+            ui.add_space(4.0);
+            self.tcp_ui(ui);
             ui.separator();
-            self.chart_ui(ui);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Chart, "延遲圖表");
+                ui.selectable_value(&mut self.tab, Tab::Hops, "中間節點");
+            });
+            match self.tab {
+                Tab::Chart => self.chart_ui(ui),
+                Tab::Hops => self.hops_ui(ui),
+            }
         });
     }
 

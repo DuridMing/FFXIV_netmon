@@ -19,10 +19,18 @@ pub fn documents_dir() -> Option<PathBuf> {
     }
 }
 
-/// 用預設程式開啟檔案（HTML 會用瀏覽器開）
+/// 用預設程式開啟檔案（HTML 會用瀏覽器開）。
+/// 透過檔案總管開啟：程式以系統管理員身分執行時，瀏覽器才不會也跟著用系統管理員身分開。
 pub fn open(path: &Path) {
-    let file = HSTRING::from(path.as_os_str());
+    let file = HSTRING::from(format!("\"{}\"", path.display()));
     unsafe {
-        ShellExecuteW(None, w!("open"), &file, None, None, SW_SHOWNORMAL);
+        ShellExecuteW(
+            None,
+            w!("open"),
+            w!("explorer.exe"),
+            &file,
+            None,
+            SW_SHOWNORMAL,
+        );
     }
 }

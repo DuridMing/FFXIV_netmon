@@ -9,9 +9,12 @@ use crossbeam_channel::Receiver;
 use crate::detector::{self, GameEvent, GameTracker};
 use crate::diagnosis::{self, LayerState};
 use crate::events::{EventDetector, IncidentKind, RECENT};
+use crate::game_tcp::{GameTcpReport, GameTcpTracker, TcpStatus};
+use crate::hops::{HopReport, HopTracker};
 use crate::stats::{Summary, Window};
 use crate::storage::{self, Sample, Storage};
 use crate::trace::{self, Trace};
+use crate::win::elevation;
 use crate::win::icmp::{EchoResult, Icmp};
 use crate::win::wlan::{WifiInfo, Wlan};
 use crate::win::{route, time};
@@ -53,6 +56,13 @@ pub enum MonitorMsg {
         wifi: Option<WifiInfo>,
         game: GameStatus,
         layers: Vec<LayerReport>,
+        /// 遊戲連線的 TCP 統計
+        tcp: TcpStatus,
+        /// 中間節點追蹤的目標與各跳狀態；沒有遊戲目標時是空的
+        hop_target: Option<Ipv4Addr>,
+        hops: Vec<HopReport>,
+        /// 持續掉包的起點：(跳數, 位址)
+        hop_loss_origin: Option<(u8, Option<Ipv4Addr>)>,
     },
     Event {
         time: String,
@@ -215,14 +225,19 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
     let mut last_game_target = manual_target;
     let wlan = Wlan::open();
     let mut last_wifi: Option<WifiInfo> = None;
+    let elevated = elevation::is_elevated();
+    let mut game_tcp = GameTcpTracker::default();
+    let mut hop_tracker = HopTracker::default();
     loop {
         let round_start = Instant::now();
 
         let mut game_disconnected = false;
         // 斷線時遊戲層的視窗會被清掉，先留下斷線前的狀態給診斷用
         let mut game_before = None;
+        let mut game_conn = None;
         if manual_target.is_none() {
-            for ev in tracker.update(&detector::scan()) {
+            let snapshot = detector::scan();
+            for ev in tracker.update(&snapshot) {
                 let (text, severe) = match ev {
                     GameEvent::Started => ("偵測到遊戲程序".to_string(), false),
                     GameEvent::Exited => ("遊戲已關閉".to_string(), false),
@@ -241,20 +256,32 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
             layers[GAME].set_probe(tracker.target().map(Probe::Tcp));
             if let Some(t) = tracker.target() {
                 last_game_target = Some(t);
+                game_conn = snapshot.conn_to(t);
             }
         }
+        // 中間節點追蹤跟著目前的遊戲伺服器（手動目標也算）
+        hop_tracker.set_target(manual_target.or(tracker.target()).map(|t| *t.ip()));
 
-        // 各層同時量測，一輪最多花 TIMEOUT 的時間
-        let results: Vec<Option<Option<u32>>> = thread::scope(|s| {
+        // 各層和中間節點同時量測，一輪最多花 TIMEOUT 的時間
+        let hop_probe = hop_tracker.target().map(|t| (t, hop_tracker.probe_hops()));
+        let (results, hop_trace): (Vec<Option<Option<u32>>>, Option<Trace>) = thread::scope(|s| {
+            let hop_handle = hop_probe.map(|(t, n)| s.spawn(move || trace::traceroute(t, n)));
             let handles: Vec<_> = layers
                 .iter()
                 .map(|l| l.probe.map(|p| s.spawn(move || p.run())))
                 .collect();
-            handles
+            let results = handles
                 .into_iter()
                 .map(|h| h.map(|h| h.join().unwrap_or(None)))
-                .collect()
+                .collect();
+            (results, hop_handle.and_then(|h| h.join().ok()))
         });
+        let hop_minute = hop_trace.as_ref().and_then(|t| hop_tracker.record(t));
+        let tcp = game_tcp.update(game_conn, elevated);
+        let tcp_report = match tcp {
+            TcpStatus::Stats(r) => Some(r),
+            _ => None,
+        };
 
         let wifi = wlan.as_ref().and_then(Wlan::current);
         let wifi_event = match (&last_wifi, &wifi) {
@@ -294,19 +321,37 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
                     })
                 })
                 .collect();
-            if let Err(e) = db.record_round(ts_ms, &samples, wifi.as_ref()) {
+            let result = db
+                .record_round(ts_ms, &samples, wifi.as_ref())
+                .and_then(|()| match (tcp_report, last_game_target) {
+                    (Some(r), Some(t)) => db.record_tcp(ts_ms, &t.to_string(), &r),
+                    _ => Ok(()),
+                })
+                .and_then(|()| match (&hop_minute, hop_tracker.target()) {
+                    (Some(agg), Some(t)) => db.record_hops(ts_ms, &t.to_string(), agg),
+                    _ => Ok(()),
+                });
+            if let Err(e) = result {
                 send(event(format!("寫入記錄檔失敗，停止存檔：{e}"), true));
                 storage = None;
             }
         }
 
         let windows = [0, 1, 2, 3].map(|i| &layers[i].window);
-        if let Some(kind) = detector.check(windows, game_disconnected) {
+        let hop_reports = hop_tracker.reports();
+        let hop_loss_origin = hop_tracker.loss_origin();
+        if let Some(kind) = detector.check(windows, game_disconnected, tcp_report.as_ref()) {
             let mut states = [0, 1, 2, 3].map(|i| layers[i].state());
             if let Some(before) = game_before {
                 states[GAME] = before;
             }
-            let incident = build_incident(kind, &states, &targets, last_game_target, wifi.as_ref());
+            let extra = IncidentExtra {
+                wifi: wifi.as_ref(),
+                tcp: tcp_report,
+                hops: &hop_reports,
+                hop_loss_origin,
+            };
+            let incident = build_incident(kind, &states, &targets, last_game_target, &extra);
             if let Some(db) = &storage {
                 // 事件寫入失敗不影響監測；資料庫真的壞了，下一輪寫樣本時會回報
                 let _ = db.record_incident(
@@ -345,6 +390,10 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
             wifi,
             game,
             layers: reports,
+            tcp,
+            hop_target: hop_tracker.target(),
+            hops: hop_reports,
+            hop_loss_origin,
         }) {
             return;
         }
@@ -353,19 +402,30 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
     }
 }
 
+/// 事件發生當下的其他資訊，寫進事件詳情、也給診斷參考
+struct IncidentExtra<'a> {
+    wifi: Option<&'a WifiInfo>,
+    tcp: Option<GameTcpReport>,
+    hops: &'a [HopReport],
+    hop_loss_origin: Option<(u8, Option<Ipv4Addr>)>,
+}
+
 fn build_incident(
     kind: IncidentKind,
     states: &[LayerState; 4],
     targets: &[Option<String>],
     game_target: Option<SocketAddrV4>,
-    wifi: Option<&WifiInfo>,
+    extra: &IncidentExtra,
 ) -> Incident {
+    let wifi = extra.wifi;
     let involves_game = matches!(
         kind,
         IncidentKind::GameDisconnected
             | IncidentKind::GameUnreachable
             | IncidentKind::HighLoss(GAME)
             | IncidentKind::LatencySpike(GAME)
+            | IncidentKind::GameRetransmits
+            | IncidentKind::GameRtoTimeout
     );
     let trace = game_target
         .filter(|_| involves_game)
@@ -380,15 +440,36 @@ fn build_incident(
         Some(w) => format!("Wi-Fi：{}，訊號 {}%", w.ssid, w.quality),
         None => "Wi-Fi：沒有使用（有線網路）".into(),
     });
+    if let Some(t) = &extra.tcp {
+        details.push(format!(
+            "遊戲連線 TCP：實際延遲 {} ms（變動 {} ms），近 20 秒重傳 {} 個封包、逾時 {} 次，近 60 秒重傳 {} 個、逾時 {} 次",
+            t.smoothed_rtt_ms,
+            t.rtt_var_ms,
+            t.retrans_recent,
+            t.timeouts_recent,
+            t.retrans_60s,
+            t.timeouts_60s
+        ));
+    }
+    if !extra.hops.is_empty() {
+        details.push("中間節點（近 60 秒）：".into());
+        details.extend(hop_lines(extra.hops));
+    }
     if let (Some(t), Some(target)) = (&trace, game_target) {
         details.push(format!("traceroute 到 {}：", target.ip()));
         details.extend(trace_lines(t));
     }
 
+    let ctx = diagnosis::Context {
+        trace: trace.as_ref(),
+        wifi_quality: wifi.map(|w| w.quality),
+        hop_loss_origin: extra.hop_loss_origin,
+        retrans_recent: extra.tcp.map(|t| t.retrans_recent),
+    };
     Incident {
         time: time::now_hms(),
         title: kind.title(),
-        diagnosis: diagnosis::diagnose(kind, states, trace.as_ref(), wifi.map(|w| w.quality)),
+        diagnosis: diagnosis::diagnose(kind, states, &ctx),
         details,
     }
 }
@@ -412,6 +493,23 @@ fn layer_detail(i: usize, s: &LayerState, target: Option<String>) -> String {
         ),
         None => format!("{name}{target}：最近一次 {last}"),
     }
+}
+
+fn hop_lines(hops: &[HopReport]) -> Vec<String> {
+    hops.iter()
+        .map(|h| {
+            let addr = h.addr.map_or("*".to_string(), |a| a.to_string());
+            match h.summary {
+                Some(s) => format!(
+                    "  {:>2}  {addr}  平均 {}、掉包 {:.0}%",
+                    h.ttl,
+                    s.avg_ms.map_or("-".into(), |v| format!("{v:.1} ms")),
+                    s.loss_pct
+                ),
+                None => format!("  {:>2}  {addr}", h.ttl),
+            }
+        })
+        .collect()
 }
 
 fn trace_lines(t: &Trace) -> Vec<String> {

@@ -1,5 +1,6 @@
 //! 異常事件偵測：根據各層的量測視窗判斷何時該記錄一次事件。
 
+use crate::game_tcp::GameTcpReport;
 use crate::monitor::LAYER_NAMES;
 use crate::stats::Window;
 
@@ -15,6 +16,9 @@ const SPIKE_FACTOR: f64 = 3.0;
 const SPIKE_MIN_MS: u32 = 150;
 /// 冷卻時間（輪數）：15 × 2 秒 = 30 秒內的連鎖異常併成同一次事件
 const COOLDOWN_ROUNDS: u32 = 15;
+/// 遊戲連線近 20 秒重傳超過這個數就觸發，降到 RETRANS_OFF 以下才算恢復
+const RETRANS_ON: u32 = 5;
+const RETRANS_OFF: u32 = 1;
 
 const GAME: usize = 3;
 
@@ -26,6 +30,10 @@ pub enum IncidentKind {
     GameUnreachable,
     HighLoss(usize),
     LatencySpike(usize),
+    /// 遊戲連線近期重傳變多（需要系統管理員權限才偵測得到）
+    GameRetransmits,
+    /// 遊戲連線發生重傳逾時（RTO），連續發生會導致 90002 斷線
+    GameRtoTimeout,
 }
 
 impl IncidentKind {
@@ -35,6 +43,8 @@ impl IncidentKind {
             IncidentKind::GameUnreachable => "遊戲伺服器連不上".into(),
             IncidentKind::HighLoss(i) => format!("{} 大量掉包", LAYER_NAMES[i]),
             IncidentKind::LatencySpike(i) => format!("{} 延遲突增", LAYER_NAMES[i]),
+            IncidentKind::GameRetransmits => "遊戲連線重傳增加".into(),
+            IncidentKind::GameRtoTimeout => "遊戲連線重傳逾時".into(),
         }
     }
 
@@ -45,6 +55,8 @@ impl IncidentKind {
             IncidentKind::GameUnreachable => "game_unreachable".into(),
             IncidentKind::HighLoss(i) => format!("high_loss:{i}"),
             IncidentKind::LatencySpike(i) => format!("latency_spike:{i}"),
+            IncidentKind::GameRetransmits => "game_retransmits".into(),
+            IncidentKind::GameRtoTimeout => "game_rto_timeout".into(),
         }
     }
 }
@@ -54,16 +66,19 @@ pub struct EventDetector {
     unreachable: bool,
     high_loss: [bool; 4],
     spike: [bool; 4],
+    retransmitting: bool,
     /// 距離上次事件還剩幾輪冷卻
     cooldown: u32,
 }
 
 impl EventDetector {
     /// 每輪量測後呼叫一次。`game_disconnected` 由連線表偵測，不受冷卻限制。
+    /// `tcp` 是遊戲連線的 TCP 統計，沒有系統管理員權限時為 None。
     pub fn check(
         &mut self,
         windows: [&Window; 4],
         game_disconnected: bool,
+        tcp: Option<&GameTcpReport>,
     ) -> Option<IncidentKind> {
         self.cooldown = self.cooldown.saturating_sub(1);
 
@@ -110,6 +125,24 @@ impl EventDetector {
             self.spike[i] = spiking;
         }
         triggered.extend(lowest_loss.map(IncidentKind::HighLoss));
+
+        if let Some(t) = tcp {
+            if t.timeouts > 0 {
+                triggered.push(IncidentKind::GameRtoTimeout);
+            }
+            let was = self.retransmitting;
+            self.retransmitting = if was {
+                t.retrans_recent > RETRANS_OFF
+            } else {
+                t.retrans_recent >= RETRANS_ON
+            };
+            if self.retransmitting && !was {
+                triggered.push(IncidentKind::GameRetransmits);
+            }
+        } else {
+            self.retransmitting = false;
+        }
+
         triggered.extend(lowest_spike.map(IncidentKind::LatencySpike));
 
         let kind = if game_disconnected {
@@ -141,7 +174,7 @@ mod tests {
     }
 
     fn check(d: &mut EventDetector, w: &[Window; 4], disconnected: bool) -> Option<IncidentKind> {
-        d.check([&w[0], &w[1], &w[2], &w[3]], disconnected)
+        d.check([&w[0], &w[1], &w[2], &w[3]], disconnected, None)
     }
 
     const OK: Option<u32> = Some(10);
@@ -209,5 +242,65 @@ mod tests {
         let ok = [OK; 10];
         let w = windows_from([&ok, &ok, &ok, &ok]);
         assert_eq!(check(&mut d, &w, false), None);
+    }
+}
+
+#[cfg(test)]
+mod tcp_tests {
+    use super::*;
+
+    fn healthy() -> [Window; 4] {
+        std::array::from_fn(|_| {
+            let mut w = Window::new(30);
+            for _ in 0..10 {
+                w.push(Some(10));
+            }
+            w
+        })
+    }
+
+    fn report(retrans_recent: u32, timeouts: u32) -> GameTcpReport {
+        GameTcpReport {
+            smoothed_rtt_ms: 50,
+            rtt_var_ms: 5,
+            retrans: 0,
+            timeouts,
+            retrans_recent,
+            timeouts_recent: timeouts,
+            retrans_60s: retrans_recent,
+            timeouts_60s: timeouts,
+        }
+    }
+
+    #[test]
+    fn retransmits_trigger_once_with_hysteresis() {
+        let mut d = EventDetector::default();
+        let w = healthy();
+        let ws = [&w[0], &w[1], &w[2], &w[3]];
+        assert_eq!(d.check(ws, false, Some(&report(2, 0))), None);
+        assert_eq!(
+            d.check(ws, false, Some(&report(6, 0))),
+            Some(IncidentKind::GameRetransmits)
+        );
+        // 還在重傳就不會重複觸發；降到 1 以下才算恢復
+        d.cooldown = 0;
+        assert_eq!(d.check(ws, false, Some(&report(3, 0))), None);
+        d.check(ws, false, Some(&report(1, 0)));
+        d.cooldown = 0;
+        assert_eq!(
+            d.check(ws, false, Some(&report(5, 0))),
+            Some(IncidentKind::GameRetransmits)
+        );
+    }
+
+    #[test]
+    fn rto_timeout_triggers() {
+        let mut d = EventDetector::default();
+        let w = healthy();
+        let ws = [&w[0], &w[1], &w[2], &w[3]];
+        assert_eq!(
+            d.check(ws, false, Some(&report(1, 1))),
+            Some(IncidentKind::GameRtoTimeout)
+        );
     }
 }

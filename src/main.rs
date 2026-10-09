@@ -10,6 +10,8 @@ mod app;
 mod detector;
 mod diagnosis;
 mod events;
+mod game_tcp;
+mod hops;
 mod icon;
 mod monitor;
 mod report;
