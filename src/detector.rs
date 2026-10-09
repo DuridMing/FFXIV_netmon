@@ -7,6 +7,7 @@ use crate::win::{process, tcp_table};
 
 pub const GAME_PROCESSES: &[&str] = &["ffxiv_dx11.exe"];
 
+#[derive(Clone, Default)]
 pub struct GameSnapshot {
     pub running: bool,
     /// 遊戲目前已建立（ESTABLISHED）的遠端連線
@@ -21,13 +22,13 @@ impl GameSnapshot {
     }
 }
 
-pub fn scan() -> GameSnapshot {
-    let pids = process::find_pids(GAME_PROCESSES);
+/// 讀取遊戲程序與它的連線。Windows API 暫時失敗時回傳 None（不能當成遊戲關閉或斷線）
+pub fn scan() -> Option<GameSnapshot> {
+    let pids = process::find_pids(GAME_PROCESSES)?;
     let mut conns = Vec::new();
-    if !pids.is_empty()
-        && let Ok(all) = tcp_table::tcp_connections()
-    {
-        conns = all
+    if !pids.is_empty() {
+        conns = tcp_table::tcp_connections()
+            .ok()?
             .into_iter()
             .filter(|c| {
                 pids.contains(&c.pid)
@@ -39,11 +40,11 @@ pub fn scan() -> GameSnapshot {
     let mut remotes: Vec<SocketAddrV4> = conns.iter().map(|c| c.remote).collect();
     remotes.sort();
     remotes.dedup();
-    GameSnapshot {
+    Some(GameSnapshot {
         running: !pids.is_empty(),
         remotes,
         conns,
-    }
+    })
 }
 
 pub enum GameEvent {

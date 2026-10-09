@@ -11,14 +11,16 @@ use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoints, Points, VLine};
 use crate::game_tcp::TcpStatus;
 use crate::hops::HopReport;
 use crate::icon::Health;
-use crate::monitor::{GameStatus, Incident, LAYER_NAMES, LayerReport, MonitorMsg, WINDOW_SIZE};
+use crate::monitor::{
+    GameStatus, Incident, LAYER_NAMES, LayerReport, Monitor, MonitorMsg, WINDOW_SIZE,
+};
 use crate::report::{self, Exported};
 use crate::settings::{CloseAction, Settings};
 use crate::storage;
+use crate::wifi::{self, WifiStatus};
 use crate::win::netif::NetIf;
 use crate::win::tray::{Tray, TrayCommand};
-use crate::win::wlan::WifiInfo;
-use crate::win::{elevation, time};
+use crate::win::{elevation, shell, time};
 
 /// 圖表保留的量測次數：300 × 2 秒 = 10 分鐘
 const HISTORY: usize = 300;
@@ -42,6 +44,8 @@ const FONT_CANDIDATES: [(&str, &str, bool); 6] = [
 ];
 /// 低於這個 Wi-Fi 訊號就用黃色提醒
 const WEAK_WIFI: u32 = 50;
+const LOCATION_HINT: &str = "Windows 11 把讀取 Wi-Fi 資訊當成存取位置。\
+    到 Windows 設定 →「隱私權與安全性」→「位置」，開啟「位置服務」和「允許桌面應用程式存取您的位置」就能顯示。";
 
 /// 主畫面下半部的分頁
 #[derive(Clone, Copy, PartialEq)]
@@ -76,15 +80,17 @@ struct EventEntry {
 }
 
 pub struct App {
-    rx: Receiver<MonitorMsg>,
+    monitor: Monitor,
     /// 啟動進度，空字串代表已就緒
     status: String,
     game: Option<GameStatus>,
     layers: Vec<LayerReport>,
-    wifi: Option<WifiInfo>,
+    wifi: WifiStatus,
     net_if: Option<NetIf>,
     /// 電腦網路斷線的原因；None 代表網路正常
     network_down: Option<String>,
+    /// 記錄檔寫入失敗的原因；None 代表正常
+    storage_error: Option<String>,
     tcp: Option<TcpStatus>,
     hop_target: Option<std::net::Ipv4Addr>,
     hops: Vec<HopReport>,
@@ -105,6 +111,8 @@ pub struct App {
     tray_rx: Receiver<TrayCommand>,
     /// 從系統匣選「結束」後才真的關閉；設定成縮到系統匣時，按 X 只會隱藏視窗
     quitting: bool,
+    /// 要結束時還在匯出報告或清除紀錄：等做完再結束
+    exit_when_idle: bool,
     hide_hint_shown: bool,
     settings: Settings,
     export_rx: Option<Receiver<Result<Exported, String>>>,
@@ -116,19 +124,20 @@ pub struct App {
 impl App {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
-        rx: Receiver<MonitorMsg>,
+        monitor: Monitor,
         startup_events: Vec<(String, bool)>,
         tray: Option<Tray>,
         tray_rx: Receiver<TrayCommand>,
     ) -> Self {
         let mut app = Self {
-            rx,
+            monitor,
             status: "啟動中...".into(),
             game: None,
             layers: Vec::new(),
-            wifi: None,
+            wifi: WifiStatus::NotUsed,
             net_if: None,
             network_down: None,
+            storage_error: None,
             tcp: None,
             hop_target: None,
             hops: Vec::new(),
@@ -142,6 +151,7 @@ impl App {
             tray,
             tray_rx,
             quitting: false,
+            exit_when_idle: false,
             hide_hint_shown: false,
             settings: Settings::load(),
             export_rx: None,
@@ -196,7 +206,7 @@ impl App {
     }
 
     fn drain_messages(&mut self) {
-        while let Ok(msg) = self.rx.try_recv() {
+        while let Ok(msg) = self.monitor.rx.try_recv() {
             match msg {
                 MonitorMsg::Status(s) => self.status = s,
                 MonitorMsg::Event { time, text, severe } => self.push_event(time, text, severe),
@@ -220,9 +230,11 @@ impl App {
                     hop_loss_origin,
                     net_if,
                     network_down,
+                    storage_error,
                 } => {
                     self.net_if = net_if;
                     self.network_down = network_down;
+                    self.storage_error = storage_error;
                     self.tcp = Some(tcp);
                     self.hop_target = hop_target;
                     self.hops = hops;
@@ -230,6 +242,8 @@ impl App {
                     for (history, report) in self.history.iter_mut().zip(&layers) {
                         match report.last {
                             Some(r) => history.push_back((elapsed, r)),
+                            // 這一輪無法量測：圖上留空，不要清掉
+                            None if report.failed => {}
                             // 目標消失（例如遊戲關閉）時清掉舊的線
                             None => history.clear(),
                         }
@@ -237,8 +251,8 @@ impl App {
                             history.pop_front();
                         }
                     }
-                    self.clock_base_secs
-                        .get_or_insert_with(|| time::now_secs_of_day() - elapsed.round() as i64);
+                    // 每輪重新對時：執行中調整時間、時區或日光節約時間時，圖表的時間軸才會跟著變
+                    self.clock_base_secs = Some(time::now_secs_of_day() - elapsed.round() as i64);
                     self.round_times.push_back((elapsed, time::now_hms()));
                     if self.round_times.len() > HISTORY {
                         self.round_times.pop_front();
@@ -266,16 +280,22 @@ impl App {
 
     fn update_tray(&self) {
         let Some(tray) = &self.tray else { return };
-        let game = match (&self.game, self.layers.get(GAME_LAYER).and_then(|r| r.last)) {
+        let game_layer = self.layers.get(GAME_LAYER);
+        let game = match (&self.game, game_layer.and_then(|r| r.last)) {
             (Some(GameStatus::Connected(_) | GameStatus::Manual(_)), Some(Some(ms))) => {
                 format!("遊戲伺服器 {ms} ms")
+            }
+            (Some(GameStatus::Connected(_) | GameStatus::Manual(_)), None)
+                if game_layer.is_some_and(|r| r.failed) =>
+            {
+                "遊戲伺服器 無法量測".into()
             }
             (Some(GameStatus::Connected(_) | GameStatus::Manual(_)), _) => "遊戲伺服器 逾時".into(),
             (Some(GameStatus::NoConnection), _) => "遊戲未連線".into(),
             _ => "遊戲未執行".into(),
         };
         let mut tip = format!("FF14 連線監測\n{game}");
-        if let Some(w) = &self.wifi {
+        if let Some(w) = self.wifi.info() {
             tip.push_str(&format!("\nWi-Fi 訊號 {}%", w.quality));
         }
         tray.set_status(self.overall_health(), &tip);
@@ -297,16 +317,49 @@ impl App {
         }
     }
 
+    /// 正在匯出報告或清除紀錄（背景執行緒，程式結束的話會被中斷）
+    fn busy(&self) -> bool {
+        self.export_rx.is_some() || self.clear_rx.is_some()
+    }
+
+    /// 處理關閉視窗。要在 logic() 呼叫：視窗最小化時 eframe 不會呼叫 ui()，
+    /// 這時從工作列關閉視窗也要照設定縮到系統匣，不能直接結束。
     /// 設定成縮到系統匣時，按 X 只隱藏視窗，繼續在背景監測；否則照常結束
     fn handle_close(&mut self, ctx: &egui::Context) {
-        let Some(tray) = &self.tray else { return };
-        if self.quitting
-            || self.settings.close_action == CloseAction::Exit
-            || !ctx.input(|i| i.viewport().close_requested())
-        {
+        if self.exit_when_idle && !self.busy() {
+            self.exit_when_idle = false;
+            self.quitting = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if !ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
+        let exiting =
+            self.quitting || self.tray.is_none() || self.settings.close_action == CloseAction::Exit;
+        if exiting {
+            if self.busy() {
+                // 等匯出或清除做完再結束，不然報告會不完整、清除會被復原
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if !self.exit_when_idle {
+                    self.exit_when_idle = true;
+                    self.push_event(
+                        time::now_hms(),
+                        "正在匯出報告或清除紀錄，完成後會自動結束".into(),
+                        false,
+                    );
+                }
+            }
+            return;
+        }
+
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        let Some(tray) = self.tray.filter(Tray::is_shown) else {
+            // 系統匣圖示還沒出現（例如工作列忙碌，還在重試）：先縮到工作列，不然視窗會找不回來
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            return;
+        };
+        // 先最小化再隱藏：只隱藏的話 eframe 仍會每次重繪都畫一個看不見的畫面
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         if !self.hide_hint_shown {
             tray.notify(
@@ -468,9 +521,9 @@ impl App {
             );
             ui.label(RichText::new(text).size(16.0));
             if !self.status.is_empty() {
+                // 不用轉圈動畫：動畫會讓視窗一直重繪，跟遊戲搶顯示卡
                 ui.separator();
-                ui.spinner();
-                ui.label(&self.status);
+                ui.label(RichText::new(&self.status).color(GRAY));
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -511,16 +564,37 @@ impl App {
                 }
                 (None, None) => {}
             }
-            if let Some(w) = &self.wifi {
-                let color = if w.quality < WEAK_WIFI { YELLOW } else { GRAY };
-                ui.label(
-                    RichText::new(format!("Wi-Fi：{}　訊號 {}%", w.ssid, w.quality)).color(color),
-                );
-                if w.quality < WEAK_WIFI {
-                    ui.label(RichText::new("訊號偏弱，建議改用有線網路").color(YELLOW));
+            match &self.wifi {
+                WifiStatus::Connected(w) => {
+                    let color = if w.quality < WEAK_WIFI { YELLOW } else { GRAY };
+                    ui.label(
+                        RichText::new(format!("Wi-Fi：{}　訊號 {}%", w.ssid_text(), w.quality))
+                            .color(color),
+                    );
+                    if w.quality < WEAK_WIFI {
+                        ui.label(RichText::new("訊號偏弱，建議改用有線網路").color(YELLOW));
+                    }
                 }
+                WifiStatus::Unreadable(reason) => {
+                    let label = ui.label(
+                        RichText::new(format!("Wi-Fi：無法讀取訊號（{reason}）")).color(GRAY),
+                    );
+                    if *reason == wifi::NEED_LOCATION {
+                        label.on_hover_text(LOCATION_HINT);
+                    }
+                }
+                WifiStatus::NotUsed | WifiStatus::Disconnected => {}
             }
         });
+
+        if let Some(e) = &self.storage_error {
+            ui.label(
+                RichText::new(format!(
+                    "記錄檔寫入失敗，資料暫存在記憶體，每分鐘會再試一次：{e}"
+                ))
+                .color(RED),
+            );
+        }
 
         if let Some(i) = self.latest_incident() {
             ui.label(
@@ -542,9 +616,11 @@ impl App {
                     ui.label(
                         RichText::new("實際延遲和重傳統計需要系統管理員權限").color(GRAY),
                     );
+                    let busy = self.busy();
                     if ui
-                        .button("以系統管理員身分重新啟動")
+                        .add_enabled(!busy, egui::Button::new("以系統管理員身分重新啟動"))
                         .on_hover_text("會跳出 Windows 的權限確認視窗，按「是」後程式會重新開啟")
+                        .on_disabled_hover_text("正在匯出報告或清除紀錄，完成後才能重新啟動")
                         .clicked()
                     {
                         self.restart_as_admin(ui.ctx());
@@ -582,7 +658,16 @@ impl App {
     }
 
     fn restart_as_admin(&mut self, ctx: &egui::Context) {
-        if elevation::restart_as_admin() {
+        // 用另一個系統管理員帳號的密碼提升權限時，新的程式是以那個帳號執行；
+        // 指定資料夾，記錄檔、設定和報告才會沿用原本使用者的
+        let mut folders = Vec::new();
+        if let Some(dir) = storage::data_dir() {
+            folders.push(("--data-dir", dir.display().to_string()));
+        }
+        if let Some(dir) = report::export_dir() {
+            folders.push(("--docs-dir", dir.display().to_string()));
+        }
+        if elevation::restart_as_admin(&folders) {
             // 新的程式已經用系統管理員身分啟動，這個直接結束
             self.quitting = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -689,6 +774,7 @@ impl App {
                     ui.label(report.and_then(|r| r.target.clone()).unwrap_or("-".into()));
 
                     let last = match report.and_then(|r| r.last) {
+                        None if report.is_some_and(|r| r.failed) => "無法量測".to_string(),
                         None => "-".to_string(),
                         Some(None) => "逾時".to_string(),
                         Some(Some(ms)) => format!("{ms} ms"),
@@ -702,7 +788,12 @@ impl App {
                     ui.label(summary.map_or("-".to_string(), |s| format!("{:.1}%", s.loss_pct)));
 
                     let (health, state) = report.map_or((Health::Unknown, "-"), layer_state);
-                    ui.label(RichText::new(format!("● {state}")).color(rgb(health)));
+                    let state = ui.label(RichText::new(format!("● {state}")).color(rgb(health)));
+                    if report.is_some_and(|r| r.failed) {
+                        state.on_hover_text(
+                            "這台電腦沒辦法送出量測（例如防火牆或防毒軟體擋住這個程式連線），不算掉包。遊戲本身的連線不受影響。",
+                        );
+                    }
                     ui.end_row();
                 }
             });
@@ -850,16 +941,16 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 背景執行緒每送一筆訊息就會要求重繪，不需要持續重繪；視窗隱藏時也會呼叫這裡
+        // 背景執行緒每送一筆訊息就會要求重繪，不需要持續重繪；視窗隱藏或最小化時也會呼叫這裡
         self.drain_messages();
         self.handle_tray_commands(ctx);
         self.poll_export();
         self.poll_clear();
+        self.handle_close(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.handle_close(&ctx);
         self.confirm_clear_ui(&ctx);
 
         egui::Panel::top("header").show(ui, |ui| {
@@ -892,6 +983,7 @@ impl eframe::App for App {
         if let Some(tray) = &self.tray {
             tray.remove();
         }
+        // App 被釋放時，Monitor 會等背景執行緒把還沒寫入的量測資料寫進記錄檔
     }
 }
 
@@ -918,6 +1010,7 @@ fn incident_ui(ui: &mut egui::Ui, id: u64, incident: &Incident) {
 /// 狀態燈：最近一次逾時或掉包率 ≥ 5% 為紅，有掉包或抖動大為黃
 fn layer_state(r: &LayerReport) -> (Health, &'static str) {
     match (r.last, r.summary) {
+        (None, _) if r.failed => (Health::Warn, "無法量測"),
         (None, _) => (Health::Unknown, "無目標"),
         (Some(None), _) => (Health::Bad, "逾時"),
         (_, Some(s)) if s.loss_pct >= 5.0 => (Health::Bad, "掉包"),
@@ -930,16 +1023,19 @@ fn layer_state(r: &LayerReport) -> (Health, &'static str) {
 
 /// 載入系統的中文字型（不嵌入 exe，避免檔案變大）。回傳用了 FONT_CANDIDATES 的第幾個
 fn load_system_font(ctx: &egui::Context) -> Option<usize> {
-    let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
-    let fonts_dir = std::path::Path::new(&windir).join("Fonts");
+    let windir = shell::windows_dir().unwrap_or_else(|| "C:\\Windows".into());
+    let fonts_dir = windir.join("Fonts");
     let (index, bytes) = FONT_CANDIDATES
         .iter()
         .enumerate()
         .find_map(|(i, (file, _, _))| std::fs::read(fonts_dir.join(file)).ok().map(|b| (i, b)))?;
+    // 字型整個執行期間都要用。用 from_owned 的話 egui 內部會再複製一份（約 20 MB），
+    // 改成 'static 的資料就只有這一份
+    let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
     let mut fonts = egui::FontDefinitions::default();
     fonts
         .font_data
-        .insert("msjh".into(), Arc::new(egui::FontData::from_owned(bytes)));
+        .insert("msjh".into(), Arc::new(egui::FontData::from_static(bytes)));
     fonts
         .families
         .entry(egui::FontFamily::Proportional)

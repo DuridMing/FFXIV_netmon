@@ -18,6 +18,8 @@ const MIN_SAMPLES: usize = 10;
 pub const AGGREGATE_ROUNDS: u32 = 30;
 /// 第一次追蹤時最多看幾跳
 pub const MAX_HOPS: u8 = 20;
+/// 目標本身連得上，但路徑最後幾跳連續這麼多輪沒有回應，就當作路徑變短、那幾跳已經不在路徑上
+const STALE_ROUNDS: u32 = 5;
 
 struct HopState {
     ttl: u8,
@@ -25,6 +27,8 @@ struct HopState {
     window: Window,
     /// 這一分鐘的彙總：(次數, 掉包數, 延遲總和)
     minute: (u32, u32, u64),
+    /// 連續幾輪沒有回應
+    silent_rounds: u32,
 }
 
 #[derive(Clone)]
@@ -58,13 +62,23 @@ impl HopTracker {
         self.target
     }
 
-    /// 換目標（例如遊戲換伺服器）時清掉舊的節點資料
-    pub fn set_target(&mut self, target: Option<Ipv4Addr>) {
-        if target != self.target {
-            self.target = target;
-            self.hops.clear();
-            self.rounds = 0;
+    /// 換目標（例如遊戲換伺服器、斷線）時清掉舊的節點資料。
+    /// 舊目標還沒寫進記錄檔的部分（不滿一分鐘）會回傳出來：(舊目標, 彙總)
+    pub fn set_target(
+        &mut self,
+        target: Option<Ipv4Addr>,
+    ) -> Option<(Ipv4Addr, Vec<HopAggregate>)> {
+        if target == self.target {
+            return None;
         }
+        let flushed = self
+            .target
+            .filter(|_| self.rounds > 0)
+            .map(|old| (old, self.aggregate()));
+        self.target = target;
+        self.hops.clear();
+        self.rounds = 0;
+        flushed
     }
 
     /// 這一輪要送到第幾跳：已知路徑長度再多看 2 跳，還不知道時看 MAX_HOPS 跳
@@ -75,8 +89,9 @@ impl HopTracker {
         }
     }
 
-    /// 記錄一輪 traceroute 的結果；每 AGGREGATE_ROUNDS 輪回傳一次彙總
-    pub fn record(&mut self, trace: &Trace) -> Option<Vec<HopAggregate>> {
+    /// 記錄一輪 traceroute 的結果；每 AGGREGATE_ROUNDS 輪回傳一次彙總。
+    /// `target_reachable`：這一輪用 TCP 連得上目標本身（代表路徑是通的）
+    pub fn record(&mut self, trace: &Trace, target_reachable: bool) -> Option<Vec<HopAggregate>> {
         // 路徑長度取有史以來回應過的最遠一跳，短暫沒回應時不要把後面的節點丟掉
         let reached_len = trace
             .hops
@@ -90,6 +105,7 @@ impl HopTracker {
                 addr: None,
                 window: Window::new(WINDOW_SIZE),
                 minute: (0, 0, 0),
+                silent_rounds: 0,
             });
         }
         // 已經到達目的地時，後面多出來的跳數不會再有意義
@@ -106,8 +122,25 @@ impl HopTracker {
             hop.window.push(rtt);
             hop.minute.0 += 1;
             match rtt {
-                Some(ms) => hop.minute.2 += ms as u64,
-                None => hop.minute.1 += 1,
+                Some(ms) => {
+                    hop.minute.2 += ms as u64;
+                    hop.silent_rounds = 0;
+                }
+                None => {
+                    hop.minute.1 += 1;
+                    hop.silent_rounds += 1;
+                }
+            }
+        }
+        // 遊戲伺服器通常不回 ICMP，traceroute 永遠「沒到達」，路徑變短時舊的跳數會一直逾時，
+        // 被誤判成持續掉包。目標本身連得上就代表路徑是通的，最後幾跳一直沒回應就是已經不在路徑上了
+        if target_reachable {
+            while self
+                .hops
+                .last()
+                .is_some_and(|h| h.silent_rounds >= STALE_ROUNDS)
+            {
+                self.hops.pop();
             }
         }
 
@@ -115,23 +148,26 @@ impl HopTracker {
         if self.rounds < AGGREGATE_ROUNDS {
             return None;
         }
+        Some(self.aggregate())
+    }
+
+    /// 這一分鐘的彙總，並重新開始累計
+    fn aggregate(&mut self) -> Vec<HopAggregate> {
         self.rounds = 0;
-        Some(
-            self.hops
-                .iter_mut()
-                .map(|h| {
-                    let (count, lost, sum) = std::mem::take(&mut h.minute);
-                    let ok = count - lost;
-                    HopAggregate {
-                        ttl: h.ttl,
-                        addr: h.addr,
-                        count,
-                        lost,
-                        avg_ms: (ok > 0).then(|| sum as f64 / ok as f64),
-                    }
-                })
-                .collect(),
-        )
+        self.hops
+            .iter_mut()
+            .map(|h| {
+                let (count, lost, sum) = std::mem::take(&mut h.minute);
+                let ok = count - lost;
+                HopAggregate {
+                    ttl: h.ttl,
+                    addr: h.addr,
+                    count,
+                    lost,
+                    avg_ms: (ok > 0).then(|| sum as f64 / ok as f64),
+                }
+            })
+            .collect()
     }
 
     pub fn reports(&self) -> Vec<HopReport> {
@@ -150,16 +186,19 @@ impl HopTracker {
     ///
     /// 從來沒回應過的節點不列入判斷：路徑最後幾跳常常被防火牆擋住、完全不回應 ICMP，
     /// 算進去的話會被誤判成 100% 掉包。另外，掉包的那一段至少要有兩個有回應的節點，
-    /// 才能排除單一路由器限制回應的情況。
+    /// 才能排除單一路由器限制回應的情況。前段某一跳限制回應，不會影響後段真正的掉包判斷。
     pub fn loss_origin(&self) -> Option<(u8, Option<Ipv4Addr>)> {
         let lossy = |h: &&HopState| {
             h.window.len() >= MIN_SAMPLES
                 && h.window.summary().is_some_and(|s| s.loss_pct >= LOSS_PCT)
         };
         let responding: Vec<&HopState> = self.hops.iter().filter(|h| h.addr.is_some()).collect();
-        let first = responding.iter().position(lossy)?;
-        let tail = &responding[first..];
-        (tail.len() >= 2 && tail.iter().all(lossy)).then(|| (tail[0].ttl, tail[0].addr))
+        // 從最後一跳往前找，連續都在掉包的那一段
+        let tail_len = responding.iter().rev().take_while(|h| lossy(h)).count();
+        (tail_len >= 2).then(|| {
+            let origin = responding[responding.len() - tail_len];
+            (origin.ttl, origin.addr)
+        })
     }
 }
 
@@ -189,7 +228,7 @@ mod tests {
         for i in 0..20 {
             // 第 2 跳一半沒回應，但後面都正常
             let hop2 = if i % 2 == 0 { None } else { Some(5) };
-            t.record(&trace(&[Some(1), hop2, Some(8), Some(10)]));
+            t.record(&trace(&[Some(1), hop2, Some(8), Some(10)]), true);
         }
         assert_eq!(t.loss_origin(), None);
     }
@@ -199,9 +238,69 @@ mod tests {
         let mut t = HopTracker::default();
         for i in 0..20 {
             let bad = |ms| if i % 3 == 0 { None } else { Some(ms) };
-            t.record(&trace(&[Some(1), Some(3), bad(8), bad(10)]));
+            t.record(&trace(&[Some(1), Some(3), bad(8), bad(10)]), false);
         }
         assert_eq!(t.loss_origin().map(|(ttl, _)| ttl), Some(3));
+    }
+
+    #[test]
+    fn rate_limited_hop_does_not_hide_later_loss() {
+        let mut t = HopTracker::default();
+        for i in 0..20 {
+            // 第 2 跳限制回應，第 3、4 跳正常，第 5 跳之後真的在掉包
+            let hop2 = if i % 2 == 0 { None } else { Some(5) };
+            let bad = |ms| if i % 3 == 0 { None } else { Some(ms) };
+            t.record(
+                &trace(&[Some(1), hop2, Some(8), Some(9), bad(10), bad(11), bad(12)]),
+                false,
+            );
+        }
+        assert_eq!(t.loss_origin().map(|(ttl, _)| ttl), Some(5));
+    }
+
+    #[test]
+    fn hops_no_longer_on_path_are_dropped_when_target_is_reachable() {
+        let mut t = HopTracker::default();
+        let long = [Some(1), Some(3), Some(8), Some(9), Some(10)];
+        for _ in 0..30 {
+            t.record(&trace(&long), true);
+        }
+        // 路徑少了兩跳；遊戲伺服器不回 ICMP，traceroute 永遠沒到達
+        for _ in 0..30 {
+            t.record(&trace(&long[..3]), true);
+        }
+        assert_eq!(t.reports().len(), 3);
+        assert_eq!(t.loss_origin(), None);
+    }
+
+    #[test]
+    fn hops_are_kept_when_target_is_unreachable() {
+        let mut t = HopTracker::default();
+        let long = [Some(1), Some(3), Some(8), Some(9), Some(10)];
+        for _ in 0..30 {
+            t.record(&trace(&long), false);
+        }
+        // 第 4 跳之後完全斷掉：這是真的掉包，不能把後面的節點丟掉
+        for _ in 0..20 {
+            t.record(&trace(&long[..3]), false);
+        }
+        assert_eq!(t.reports().len(), 5);
+        assert_eq!(t.loss_origin().map(|(ttl, _)| ttl), Some(4));
+    }
+
+    #[test]
+    fn changing_target_returns_partial_minute() {
+        let mut t = HopTracker::default();
+        let a = Ipv4Addr::new(203, 0, 113, 1);
+        t.set_target(Some(a));
+        for _ in 0..5 {
+            t.record(&trace(&[Some(1), Some(3)]), true);
+        }
+        let (old, agg) = t.set_target(None).expect("should flush partial minute");
+        assert_eq!(old, a);
+        assert_eq!(agg.len(), 2);
+        assert_eq!(agg[0].count, 5);
+        assert!(t.set_target(None).is_none());
     }
 
     #[test]
@@ -211,7 +310,7 @@ mod tests {
             // 第 3 跳是最後一個會回應的節點而且偶爾掉包，後面兩跳被防火牆擋住、從來不回應。
             // 沒有後面的節點可以佐證，不能斷定是第 3 跳開始掉包
             let hop3 = if i % 3 == 0 { None } else { Some(8) };
-            t.record(&trace(&[Some(1), Some(3), hop3, None, None]));
+            t.record(&trace(&[Some(1), Some(3), hop3, None, None]), false);
         }
         assert_eq!(t.reports().len(), 3);
         assert_eq!(t.loss_origin(), None);
@@ -220,9 +319,9 @@ mod tests {
     #[test]
     fn keeps_hops_when_tail_stops_answering() {
         let mut t = HopTracker::default();
-        t.record(&trace(&[Some(1), Some(3), Some(8)]));
+        t.record(&trace(&[Some(1), Some(3), Some(8)]), false);
         // traceroute 會把結尾沒回應的節點去掉，但路徑長度要維持
-        t.record(&trace(&[Some(1)]));
+        t.record(&trace(&[Some(1)]), false);
         let reports = t.reports();
         assert_eq!(reports.len(), 3);
         assert_eq!(reports[2].last, None);
@@ -234,7 +333,7 @@ mod tests {
         let mut t = HopTracker::default();
         let mut agg = None;
         for _ in 0..AGGREGATE_ROUNDS {
-            agg = t.record(&trace(&[Some(2), None]));
+            agg = t.record(&trace(&[Some(2), None]), false);
         }
         let agg = agg.expect("should aggregate after AGGREGATE_ROUNDS");
         assert_eq!(agg[0].count, AGGREGATE_ROUNDS);
@@ -254,7 +353,7 @@ mod live_tests {
         t.set_target(Some(Ipv4Addr::new(1, 1, 1, 1)));
         for _ in 0..5 {
             let trace = crate::trace::traceroute(t.target().unwrap(), t.probe_hops());
-            t.record(&trace);
+            t.record(&trace, false);
         }
         for h in t.reports() {
             println!(

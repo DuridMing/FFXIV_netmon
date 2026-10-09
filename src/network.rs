@@ -12,9 +12,11 @@ use crate::win::route;
 const ISP_TRACE_HOPS: u8 = 8;
 /// 有網路但找不到 ISP 節點時，每幾輪重找一次（15 × 2 秒 = 30 秒）
 const ISP_RETRY_ROUNDS: u32 = 15;
+/// 剛恢復連線或剛換網路時 traceroute 可能還不通，比較快再找一次（3 × 2 秒 = 6 秒）
+const ISP_QUICK_RETRY_ROUNDS: u32 = 3;
 
 const NO_ROUTE: &str = "網路卡有連線，但沒有取得對外的路由（可能是沒有拿到閘道，或 VPN 正在切換）";
-const NO_ADAPTER: &str = "找不到可以上網的網路卡";
+const NO_ADAPTER: &str = "沒有任何網路卡連上網路（網路線沒有接上、Wi-Fi 沒有連線，或網路卡被停用）";
 
 /// 給異常偵測用的網路狀態
 #[derive(Clone, Copy, Default)]
@@ -63,13 +65,14 @@ impl NetworkWatcher {
     pub fn update(&mut self) -> NetworkRound {
         let route = route::best_route(INTERNET_TARGET);
         // 有路由時查路由用的那張網卡（讀不到就當作未知，不要沿用舊網卡的資料）；
-        // 沒有路由時查最後一張用過的網卡，才知道是網路線拔掉還是只是沒有路由
+        // 沒有路由時查最後一張用過的網卡，才知道是網路線拔掉還是只是沒有路由。
+        // 一開始就沒有網路（還沒用過任何網卡）時，從實體網卡裡找出原因
         let net_if = match &route {
             Some(r) => netif::interface(r.if_index),
-            None => self
-                .last_if
-                .as_ref()
-                .and_then(|n| netif::interface(n.index)),
+            None => match &self.last_if {
+                Some(n) => netif::interface(n.index),
+                None => offline_interface(),
+            },
         };
         let down_reason = match (&route, &net_if) {
             (_, Some(n)) if !n.connected() => Some(n.down_reason().to_string()),
@@ -97,21 +100,34 @@ impl NetworkWatcher {
 
         let mut targets_changed = false;
         if !is_down && let Some(r) = &route {
-            if r.next_hop.is_some() && r.next_hop != self.gateway {
-                // 換網卡或換路由器：重新找 ISP 節點，不然會一直量舊的目標
+            let if_changed = self.last_if.as_ref().map(|n| n.index) != Some(r.if_index);
+            // 換網卡、換路由器，或斷線後恢復（可能已經換到另一個網路，只是路由器 IP 剛好一樣）：
+            // 重新找 ISP 節點，不然會一直量舊的目標。
+            // PPPoE 撥號、VPN 這類直接連線的路由沒有路由器（next_hop 是 None），路由器那層就不量
+            if r.next_hop != self.gateway || if_changed || was_down {
+                let (old_gateway, old_isp) = (self.gateway, self.isp);
                 self.gateway = r.next_hop;
                 self.isp = find_isp_hop(self.gateway);
-                self.isp_retry_in = ISP_RETRY_ROUNDS;
-                targets_changed = true;
-                events.push((
-                    format!(
-                        "路由器變更為 {}，ISP 節點：{}",
-                        fmt_addr(self.gateway),
-                        self.isp.map_or("找不到".into(), |h| h.to_string())
-                    ),
-                    false,
-                ));
-            } else if self.isp.is_none() && self.gateway.is_some() {
+                self.isp_retry_in = if self.isp.is_some() {
+                    ISP_RETRY_ROUNDS
+                } else {
+                    ISP_QUICK_RETRY_ROUNDS
+                };
+                let isp = self.isp.map_or("找不到".into(), |h| h.to_string());
+                if self.gateway != old_gateway {
+                    targets_changed = true;
+                    events.push((
+                        format!(
+                            "路由器變更為 {}，ISP 節點：{isp}",
+                            fmt_gateway(self.gateway)
+                        ),
+                        false,
+                    ));
+                } else if self.isp != old_isp {
+                    targets_changed = true;
+                    events.push((format!("ISP 節點變更為 {isp}"), false));
+                }
+            } else if self.isp.is_none() {
                 // 啟動時沒網路或剛換路由器時 traceroute 還不通，過一陣子再找一次
                 self.isp_retry_in = self.isp_retry_in.saturating_sub(1);
                 if self.isp_retry_in == 0 {
@@ -144,8 +160,27 @@ impl NetworkWatcher {
     }
 }
 
-fn fmt_addr(a: Option<Ipv4Addr>) -> String {
-    a.map_or("-".into(), |a| a.to_string())
+/// 路由器位址；沒有路由器時說明可能的原因
+fn fmt_gateway(a: Option<Ipv4Addr>) -> String {
+    a.map_or("無（電腦直接撥號或使用 VPN）".into(), |a| {
+        a.to_string()
+    })
+}
+
+/// 一開始就沒有網路時，找出最可能是哪張網卡的問題：
+/// 有連線的那張（只是沒有路由）優先；只有一張實體網卡時就是它；有好幾張都沒連線就無法判斷
+fn offline_interface() -> Option<NetIf> {
+    let cards: Vec<NetIf> = netif::physical_interfaces()
+        .into_iter()
+        .filter(|n| !n.admin_down)
+        .collect();
+    if let Some(n) = cards.iter().find(|n| n.connected()) {
+        return Some(n.clone());
+    }
+    match <[NetIf; 1]>::try_from(cards) {
+        Ok([n]) => Some(n),
+        Err(_) => None,
+    }
 }
 
 /// traceroute，回傳路由器之後第一個公開 IP 的節點；找不到就退而求其次用第一個私有 IP 節點

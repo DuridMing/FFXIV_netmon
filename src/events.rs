@@ -74,12 +74,15 @@ pub struct EventDetector {
     retransmitting: bool,
     /// 距離上次事件還剩幾輪冷卻
     cooldown: u32,
+    /// 遊戲斷線跟電腦網路中斷發生在同一輪：這輪先回報網路中斷，遊戲斷線留到下一輪
+    pending_disconnect: bool,
 }
 
 impl EventDetector {
     /// 每輪量測後呼叫一次。`game_disconnected` 由連線表偵測，不受冷卻限制。
     /// `network` 是電腦本身的網路狀態（由 NetworkWatcher 判斷）：剛斷線時回報一次「電腦網路中斷」，
     /// 斷線期間各層的掉包都是它造成的，不再另外回報；但遊戲斷線仍然要記錄，才不會漏掉斷線次數。
+    /// 冷卻期間開始的問題先不回報，冷卻結束時還持續就會回報（很快就恢復的連鎖異常會被併掉）。
     /// `tcp` 是遊戲連線的 TCP 統計，沒有系統管理員權限時為 None。
     pub fn check(
         &mut self,
@@ -90,7 +93,6 @@ impl EventDetector {
     ) -> Option<IncidentKind> {
         self.cooldown = self.cooldown.saturating_sub(1);
 
-        // 每層狀態都要更新，即使在冷卻中，才不會冷卻結束後又補觸發
         let mut triggered = Vec::new();
 
         let game = windows[GAME];
@@ -121,7 +123,9 @@ impl EventDetector {
                 lowest_loss.get_or_insert(i);
             }
 
-            let spiking = match (w.last(), s.avg_ms) {
+            // 跟最新一筆之前的平均比；把最新一筆算進平均的話，實際門檻會比 3 倍高很多
+            let baseline = w.summary_before_last(RECENT).and_then(|b| b.avg_ms);
+            let spiking = match (w.last(), baseline) {
                 (Some(Some(ms)), Some(avg)) => {
                     ms >= SPIKE_MIN_MS && ms as f64 >= avg * SPIKE_FACTOR
                 }
@@ -153,7 +157,9 @@ impl EventDetector {
 
         triggered.extend(lowest_spike.map(IncidentKind::LatencySpike));
 
+        let game_disconnected = game_disconnected || std::mem::take(&mut self.pending_disconnect);
         let kind = if network.went_down {
+            self.pending_disconnect = game_disconnected;
             Some(IncidentKind::NetworkDown)
         } else if game_disconnected {
             Some(IncidentKind::GameDisconnected)
@@ -162,12 +168,29 @@ impl EventDetector {
         } else if self.cooldown == 0 {
             triggered.first().copied()
         } else {
+            // 冷卻中：當作還沒觸發，問題持續到冷卻結束就會回報
+            for &kind in &triggered {
+                self.forget(kind);
+            }
             None
         };
         if kind.is_some() {
             self.cooldown = COOLDOWN_ROUNDS;
         }
         kind
+    }
+
+    /// 把剛觸發的狀態改回未觸發，下一輪條件還成立時會再觸發一次
+    fn forget(&mut self, kind: IncidentKind) {
+        match kind {
+            IncidentKind::GameUnreachable => self.unreachable = false,
+            IncidentKind::HighLoss(i) => self.high_loss[i] = false,
+            IncidentKind::LatencySpike(i) => self.spike[i] = false,
+            IncidentKind::GameRetransmits => self.retransmitting = false,
+            IncidentKind::GameRtoTimeout
+            | IncidentKind::GameDisconnected
+            | IncidentKind::NetworkDown => {}
+        }
     }
 }
 
@@ -238,6 +261,63 @@ mod tests {
             check(&mut d, &w, true),
             Some(IncidentKind::GameDisconnected)
         ));
+    }
+
+    #[test]
+    fn problem_starting_in_cooldown_is_reported_after_cooldown() {
+        let mut d = EventDetector::default();
+        let ok = [OK; 10];
+        let bad = [OK, OK, OK, None, None, OK, OK, None, OK, OK];
+        let w = windows_from([&bad, &ok, &ok, &ok]);
+        assert_eq!(check(&mut d, &w, false), Some(IncidentKind::HighLoss(0)));
+
+        // ISP 在冷卻中開始持續掉包：冷卻期間不回報
+        let w = windows_from([&bad, &bad, &ok, &ok]);
+        for _ in 1..COOLDOWN_ROUNDS {
+            assert_eq!(check(&mut d, &w, false), None);
+        }
+        // 冷卻結束時還在掉包，就要回報
+        assert_eq!(check(&mut d, &w, false), Some(IncidentKind::HighLoss(1)));
+        // 之後不重複回報
+        d.cooldown = 0;
+        assert_eq!(check(&mut d, &w, false), None);
+    }
+
+    #[test]
+    fn problem_recovered_during_cooldown_is_not_reported() {
+        let mut d = EventDetector::default();
+        let ok = [OK; 10];
+        let bad = [OK, OK, OK, None, None, OK, OK, None, OK, OK];
+        let w = windows_from([&bad, &ok, &ok, &ok]);
+        assert!(check(&mut d, &w, false).is_some());
+        let w = windows_from([&bad, &bad, &ok, &ok]);
+        assert_eq!(check(&mut d, &w, false), None);
+        let w = windows_from([&ok, &ok, &ok, &ok]);
+        for _ in 0..COOLDOWN_ROUNDS * 2 {
+            assert_eq!(check(&mut d, &w, false), None);
+        }
+    }
+
+    #[test]
+    fn latency_spike_threshold_is_three_times_previous_average() {
+        // 穩定 45 ms 跳到 165 ms：超過 150 ms，也超過之前平均的 3 倍（135 ms）
+        let ok = [OK; 10];
+        let mut spiky = [Some(45); 11];
+        spiky[10] = Some(165);
+        let w = windows_from([&ok, &ok, &ok, &spiky]);
+        let mut d = EventDetector::default();
+        assert_eq!(
+            check(&mut d, &w, false),
+            Some(IncidentKind::LatencySpike(3))
+        );
+
+        // 剛開始只有幾筆樣本時也抓得到
+        let w = windows_from([&ok, &ok, &ok, &[Some(45), Some(45), Some(165)]]);
+        let mut d = EventDetector::default();
+        assert_eq!(
+            check(&mut d, &w, false),
+            Some(IncidentKind::LatencySpike(3))
+        );
     }
 
     #[test]
@@ -363,5 +443,29 @@ mod network_tests {
             d.check(ws, true, still_down, None),
             Some(IncidentKind::GameDisconnected)
         );
+    }
+
+    #[test]
+    fn game_disconnect_in_same_round_as_network_down_is_reported_next_round() {
+        let mut d = EventDetector::default();
+        let w: [Window; 4] = std::array::from_fn(|_| Window::new(30));
+        let ws = [&w[0], &w[1], &w[2], &w[3]];
+        let went_down = NetworkSignal {
+            down: true,
+            went_down: true,
+        };
+        let still_down = NetworkSignal {
+            down: true,
+            went_down: false,
+        };
+        assert_eq!(
+            d.check(ws, true, went_down, None),
+            Some(IncidentKind::NetworkDown)
+        );
+        assert_eq!(
+            d.check(ws, false, still_down, None),
+            Some(IncidentKind::GameDisconnected)
+        );
+        assert_eq!(d.check(ws, false, still_down, None), None);
     }
 }

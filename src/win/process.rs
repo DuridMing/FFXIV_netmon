@@ -5,11 +5,10 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 
-pub fn find_pids(names: &[&str]) -> Vec<u32> {
+/// 找出名稱符合的程序；無法取得程序清單時回傳 None（不代表程序不存在）
+pub fn find_pids(names: &[&str]) -> Option<Vec<u32>> {
     let mut pids = Vec::new();
-    let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-        return pids;
-    };
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?;
 
     let mut entry = PROCESSENTRY32W {
         dwSize: size_of::<PROCESSENTRY32W>() as u32,
@@ -32,5 +31,5 @@ pub fn find_pids(names: &[&str]) -> Vec<u32> {
     unsafe {
         let _ = CloseHandle(snap);
     }
-    pids
+    Some(pids)
 }

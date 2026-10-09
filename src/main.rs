@@ -7,6 +7,9 @@
 //! 程式自己會用到的參數（重新啟動時帶上）：
 //!   --renderer dx12|gl|warp         繪圖方式，預設 dx12；初始化失敗時會依序改用下一種
 //!   --restarted                     由舊的程式重新啟動，要等舊的結束再取得執行權
+//!   --crash-restarts N              執行中繪圖出錯而重新啟動的次數，避免無限重啟
+//!   --data-dir PATH                 記錄檔和設定的資料夾（以系統管理員身分重新啟動時沿用原本使用者的）
+//!   --docs-dir PATH                 匯出報告的資料夾（同上）
 //!   --test-gpu-failure              測試用：讓 DirectX 12 初始化失敗，檢查備援流程
 
 #![windows_subsystem = "windows"]
@@ -25,11 +28,14 @@ mod settings;
 mod stats;
 mod storage;
 mod trace;
+mod wifi;
 mod win;
 
 use std::net::SocketAddrV4;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -42,6 +48,10 @@ pub const APP_NAME: &str = "FF14 連線監測";
 const APP_ICON_SIZE: u32 = 64;
 /// 重新啟動時，等舊的程式結束最多等多久
 const RESTART_WAIT_MS: u32 = 15_000;
+/// 執行中繪圖出錯時，連續重新啟動最多幾次（每次都很快又出錯就放棄）
+const MAX_CRASH_RESTARTS: u32 = 3;
+/// 執行超過這麼久才出錯，就不算連續出錯，重新計算次數
+const CRASH_RESET_AFTER: Duration = Duration::from_secs(60);
 
 /// 畫面已經初始化成功（eframe 建好繪圖裝置後才會呼叫 app creator）。
 /// 之後 run_native 回傳錯誤就不是「這種繪圖方式不能用」，而是執行中發生的錯誤
@@ -91,8 +101,9 @@ struct Options {
     target: Result<Option<SocketAddrV4>, String>,
     renderer: Renderer,
     restarted: bool,
+    crash_restarts: u32,
     test_gpu_failure: bool,
-    /// 重新啟動時要原樣帶過去的參數（不含 --renderer、--restarted）
+    /// 重新啟動時要原樣帶過去的參數（不含 --renderer、--restarted、--crash-restarts）
     passthrough: Vec<String>,
 }
 
@@ -115,12 +126,22 @@ impl Options {
             .flatten()
             .and_then(|s| Renderer::parse(&s))
             .unwrap_or(Renderer::Dx12);
+        let crash_restarts = value_of("--crash-restarts")
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if let Some(dir) = value_of("--data-dir").flatten() {
+            storage::set_data_dir(PathBuf::from(dir));
+        }
+        if let Some(dir) = value_of("--docs-dir").flatten() {
+            report::set_export_dir(PathBuf::from(dir));
+        }
 
         let mut passthrough = Vec::new();
         let mut iter = args.iter();
         while let Some(a) = iter.next() {
             match a.as_str() {
-                "--renderer" => {
+                "--renderer" | "--crash-restarts" => {
                     iter.next();
                 }
                 "--restarted" => {}
@@ -132,6 +153,7 @@ impl Options {
             target,
             renderer,
             restarted: args.iter().any(|a| a == "--restarted"),
+            crash_restarts,
             test_gpu_failure: args.iter().any(|a| a == "--test-gpu-failure"),
             passthrough,
         }
@@ -155,13 +177,24 @@ fn main() {
         }
     };
 
+    let started = Instant::now();
     let Err(err) = run(&opts) else { return };
     // winit 一個程式只能建立一次事件迴圈，不管哪種情況都要重新啟動自己
     if GRAPHICS_READY.load(Ordering::SeqCst) {
-        // 畫面原本好好的，執行中才出錯（例如顯示卡驅動重置）：用同一種繪圖方式重開，繼續監測
+        // 畫面原本好好的，執行中才出錯（例如顯示卡驅動重置）：用同一種繪圖方式重開，繼續監測。
+        // 每次一開就出錯的話不要無限重啟
+        let count = if started.elapsed() > CRASH_RESET_AFTER {
+            0
+        } else {
+            opts.crash_restarts
+        };
+        if count >= MAX_CRASH_RESTARTS {
+            show_runtime_error(&err.to_string());
+            return;
+        }
         drop(lock);
-        if let Err(e) = relaunch(&opts, opts.renderer) {
-            show_fatal(&format!("{err}\n無法重新啟動：{e}"));
+        if let Err(e) = relaunch(&opts, opts.renderer, count + 1) {
+            show_relaunch_failed(&err.to_string(), &e.to_string());
         }
         return;
     }
@@ -169,8 +202,8 @@ fn main() {
     match opts.renderer.next() {
         Some(next) => {
             drop(lock);
-            if let Err(e) = relaunch(&opts, next) {
-                show_fatal(&format!("{err}\n無法重新啟動：{e}"));
+            if let Err(e) = relaunch(&opts, next, 0) {
+                show_relaunch_failed(&err.to_string(), &e.to_string());
             }
         }
         None => show_fatal(&err.to_string()),
@@ -228,7 +261,7 @@ fn run(opts: &Options) -> eframe::Result {
         Box::new(move |cc| {
             GRAPHICS_READY.store(true, Ordering::SeqCst);
             let ctx = cc.egui_ctx.clone();
-            let rx = monitor::spawn(target, move || ctx.request_repaint());
+            let monitor = monitor::spawn(target, move || ctx.request_repaint());
 
             let (tray_tx, tray_rx) = crossbeam_channel::unbounded();
             let ctx = cc.egui_ctx.clone();
@@ -239,7 +272,7 @@ fn run(opts: &Options) -> eframe::Result {
 
             Ok(Box::new(app::App::new(
                 cc,
-                rx,
+                monitor,
                 startup_events,
                 tray,
                 tray_rx,
@@ -275,14 +308,44 @@ fn dx12_config(software: bool, test_failure: bool) -> eframe::WgpuConfiguration 
     config
 }
 
-fn relaunch(opts: &Options, renderer: Renderer) -> std::io::Result<()> {
-    std::process::Command::new(std::env::current_exe()?)
-        .args(&opts.passthrough)
-        .args(["--renderer", renderer.arg(), "--restarted"])
-        .spawn()
-        .map(|_| ())
+fn relaunch(opts: &Options, renderer: Renderer, crash_restarts: u32) -> std::io::Result<()> {
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.args(&opts.passthrough)
+        .args(["--renderer", renderer.arg(), "--restarted"]);
+    if crash_restarts > 0 {
+        cmd.args(["--crash-restarts", &crash_restarts.to_string()]);
+    }
+    cmd.spawn().map(|_| ())
 }
 
+/// 畫面出錯後要重新啟動自己，但啟動失敗
+fn show_relaunch_failed(err: &str, relaunch_err: &str) {
+    dialog::error(
+        APP_NAME,
+        &format!(
+            "{APP_NAME} 的畫面發生錯誤，需要重新啟動，但無法重新啟動程式。\n\n\
+             畫面錯誤：{err}\n\
+             重新啟動失敗：{relaunch_err}\n\n\
+             請自己再開一次程式。如果程式檔案被移動、改名，或被防毒軟體擋住，也會發生這個問題。"
+        ),
+    );
+}
+
+/// 執行中畫面一直出錯，重新啟動好幾次都一樣
+fn show_runtime_error(err: &str) {
+    dialog::error(
+        APP_NAME,
+        &format!(
+            "{APP_NAME} 的畫面一直發生錯誤，重新啟動 {MAX_CRASH_RESTARTS} 次都沒有改善，程式先停止。\n\n\
+             錯誤訊息：{err}\n\n\
+             可以試試：\n\
+             ・更新顯示卡驅動程式\n\
+             ・重新開機後再試一次"
+        ),
+    );
+}
+
+/// 所有繪圖方式都無法初始化
 fn show_fatal(err: &str) {
     dialog::error(
         APP_NAME,

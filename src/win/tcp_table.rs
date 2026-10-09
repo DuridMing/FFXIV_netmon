@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+    GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
 };
 use windows::Win32::Networking::WinSock::AF_INET;
 
@@ -48,9 +48,15 @@ pub fn tcp_connections() -> io::Result<Vec<TcpConn>> {
         size = (buf.len() * 4) as u32;
     }
 
-    let table = unsafe { &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID) };
-    let rows =
-        unsafe { std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize) };
+    // 表格尾端宣告成長度 1 的陣列，實際有 dwNumEntries 筆；
+    // 要從原始指標取得欄位位址，不能透過 &table.table（參照只涵蓋第一筆）
+    let table = buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
+    let rows = unsafe {
+        std::slice::from_raw_parts(
+            (&raw const (*table).table).cast::<MIB_TCPROW_OWNER_PID>(),
+            (*table).dwNumEntries as usize,
+        )
+    };
 
     Ok(rows
         .iter()

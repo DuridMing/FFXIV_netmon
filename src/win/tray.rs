@@ -3,7 +3,7 @@
 //! 圖示需要一個視窗接收滑鼠訊息，所以另開一條執行緒跑隱藏視窗和訊息迴圈。
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 
@@ -16,10 +16,10 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, AppendMenuW, ChangeWindowMessageFilterEx, CreateIcon,
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, FindWindowW,
-    GetCursorPos, GetMessageW, GetWindowThreadProcessId, HICON, MF_STRING, MSG, MSGFLT_ALLOW,
-    PostMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+    GetCursorPos, GetMessageW, GetWindowThreadProcessId, HICON, KillTimer, MF_STRING, MSG,
+    MSGFLT_ALLOW, PostMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
+    SetTimer, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
 };
 use windows::core::{PCWSTR, w};
 
@@ -37,6 +37,9 @@ const ICON_ID: u32 = 1;
 const MENU_SHOW: usize = 1;
 const MENU_EXIT: usize = 2;
 const ICON_SIZE: u32 = 32;
+/// 圖示加入失敗（例如工作列忙碌）時，每隔多久再試一次
+const RETRY_TIMER_ID: usize = 1;
+const RETRY_MS: u32 = 2000;
 
 /// HWND、HICON 都不是 Send，存成整數才能在執行緒間共用
 #[derive(Clone, Copy)]
@@ -58,6 +61,8 @@ static STATE: Mutex<State> = Mutex::new(State {
 });
 /// 檔案總管重啟後會廣播這個訊息，要重新加入圖示
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+/// 圖示目前有沒有成功加到系統匣
+static ADDED: AtomicBool = AtomicBool::new(false);
 
 /// 建立系統匣圖示。使用者點圖示或選單時會呼叫 `handler`（在系統匣執行緒上）。
 pub fn spawn(tip: &str, handler: impl Fn(TrayCommand) + Send + Sync + 'static) -> Option<Tray> {
@@ -106,7 +111,7 @@ pub fn spawn(tip: &str, handler: impl Fn(TrayCommand) + Send + Sync + 'static) -
             icons: Health::ALL.map(|h| make_icon(hinstance, h)),
         };
         let _ = TRAY.set(tray);
-        tray.add();
+        tray.add_or_retry();
         let _ = tx.send(Some(tray));
 
         let mut msg = MSG::default();
@@ -132,33 +137,54 @@ impl Tray {
         HICON(self.icons[i] as *mut c_void)
     }
 
-    fn add(&self) {
-        let Ok(state) = STATE.lock() else { return };
+    fn add(&self) -> bool {
+        let Ok(state) = STATE.lock() else {
+            return false;
+        };
         let mut d = self.data();
         d.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         d.uCallbackMessage = WM_TRAY;
         d.hIcon = self.icon(state.health);
         copy_wide(&mut d.szTip, &state.tip);
+        let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &d) }.as_bool();
+        ADDED.store(ok, Ordering::SeqCst);
+        ok
+    }
+
+    /// 在系統匣執行緒上呼叫：加入圖示，失敗時開計時器定期重試
+    fn add_or_retry(&self) {
+        let hwnd = Some(HWND(self.hwnd as *mut c_void));
         unsafe {
-            let _ = Shell_NotifyIconW(NIM_ADD, &d);
+            if self.add() {
+                let _ = KillTimer(hwnd, RETRY_TIMER_ID);
+            } else {
+                SetTimer(hwnd, RETRY_TIMER_ID, RETRY_MS, None);
+            }
         }
     }
 
-    /// 更新燈號顏色和滑鼠提示文字；沒有變化就不呼叫系統
+    /// 圖示目前是否顯示在系統匣（加入失敗、還在重試時為 false）
+    pub fn is_shown(&self) -> bool {
+        ADDED.load(Ordering::SeqCst)
+    }
+
+    /// 更新燈號顏色和滑鼠提示文字；沒有變化就不呼叫系統。
+    /// 系統沒有接受這次更新時不記下新狀態，下一次呼叫會再送一次
     pub fn set_status(&self, health: Health, tip: &str) {
         let Ok(mut state) = STATE.lock() else { return };
         if state.health == health && state.tip == tip {
             return;
         }
-        state.health = health;
-        state.tip = tip.to_string();
 
         let mut d = self.data();
         d.uFlags = NIF_ICON | NIF_TIP;
         d.hIcon = self.icon(health);
         copy_wide(&mut d.szTip, tip);
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
+        let ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &d) }.as_bool();
+        // 圖示還沒加入時也要記下來，加入時才會用最新的狀態
+        if ok || !self.is_shown() {
+            state.health = health;
+            state.tip = tip.to_string();
         }
     }
 
@@ -215,11 +241,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         return LRESULT(0);
     }
     let taskbar_created = TASKBAR_CREATED.load(Ordering::Relaxed);
-    if taskbar_created != 0
-        && msg == taskbar_created
+    if ((taskbar_created != 0 && msg == taskbar_created)
+        || (msg == WM_TIMER && wparam.0 == RETRY_TIMER_ID))
         && let Some(tray) = TRAY.get()
     {
-        tray.add();
+        tray.add_or_retry();
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
@@ -243,6 +269,8 @@ unsafe fn show_menu(hwnd: HWND) {
             hwnd,
             None,
         );
+        // TrackPopupMenu 文件要求：通知區域的選單關閉後送一個空訊息，下次右鍵選單才不會一閃就關掉
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(menu);
 
         match cmd.0 as usize {

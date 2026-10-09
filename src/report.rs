@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -27,6 +28,21 @@ const GAME_LAYER: i64 = 3;
 /// 中間節點摘要最多列出幾個目標（遊戲換伺服器時會有多個）
 const MAX_HOP_TARGETS: usize = 3;
 const WEEKDAYS: [&str; 7] = ["日", "一", "二", "三", "四", "五", "六"];
+
+/// 命令列指定的匯出資料夾（以另一個帳號提升權限時，沿用原本使用者的「文件」）
+static EXPORT_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_export_dir(dir: PathBuf) {
+    let _ = EXPORT_DIR.set(dir);
+}
+
+/// 匯出資料夾：文件\ff14-netmon
+pub fn export_dir() -> Option<PathBuf> {
+    if let Some(dir) = EXPORT_DIR.get() {
+        return Some(dir.clone());
+    }
+    Some(shell::documents_dir()?.join("ff14-netmon"))
+}
 
 pub struct Exported {
     pub html: PathBuf,
@@ -97,9 +113,7 @@ pub fn export(hours: u32) -> Result<Exported, String> {
         .map_err(|e| format!("無法開啟記錄檔：{e}"))?;
     let since = storage::now_ms() - hours as i64 * 60 * 60 * 1000;
 
-    let dir = shell::documents_dir()
-        .ok_or("找不到「文件」資料夾")?
-        .join("ff14-netmon");
+    let dir = export_dir().ok_or("找不到「文件」資料夾")?;
     fs::create_dir_all(&dir).map_err(|e| format!("無法建立資料夾：{e}"))?;
     let stamp = time::now_stamp();
     let html_path = dir.join(format!("report-{stamp}.html"));
@@ -185,14 +199,18 @@ fn build_minute_csv(conn: &Connection, since: i64) -> rusqlite::Result<String> {
 
 fn build_html(conn: &Connection, since: i64, hours: u32) -> rusqlite::Result<String> {
     let detailed = hours <= DETAIL_HOURS;
-    // 24 小時內每小時一列，更長的範圍每天一列
-    let bucket_fmt = if detailed { "%m/%d %H:00" } else { "%Y-%m-%d" };
+    // 24 小時內每小時一列，更長的範圍每天一列。鍵要含年份，跨年時順序才不會亂
+    let bucket_fmt = if detailed {
+        "%Y-%m-%d %H:00"
+    } else {
+        "%Y-%m-%d"
+    };
     let layers = query_layer_stats(conn, since)?;
     let buckets = query_buckets(conn, since, bucket_fmt)?;
     let incidents = query_incidents(conn, since)?;
     // 舊版記錄檔沒有這些表，查不到就略過
-    let tcp = query_tcp_summary(conn, since).ok().flatten();
-    let hops = query_hops(conn, since).unwrap_or_default();
+    let tcp = optional_table(query_tcp_summary(conn, since))?.flatten();
+    let hops = optional_table(query_hops(conn, since))?.unwrap_or_default();
     let generated: String =
         conn.query_row("SELECT datetime('now', 'localtime')", [], |r| r.get(0))?;
     let label = range_label(hours);
@@ -308,7 +326,8 @@ fn write_heatmap(h: &mut String, conn: &Connection, since: i64) -> rusqlite::Res
             r.get::<_, i64>(2)?,
         ))
     })?;
-    for (w, hour, n) in rows.flatten() {
+    for row in rows {
+        let (w, hour, n) = row?;
         if let (Some(row), Ok(hour)) = (counts.get_mut(w as usize), usize::try_from(hour))
             && let Some(cell) = row.get_mut(hour)
         {
@@ -331,7 +350,8 @@ fn write_heatmap(h: &mut String, conn: &Connection, since: i64) -> rusqlite::Res
             r.get::<_, i64>(3)?,
         ))
     })?;
-    for (w, hour, n, lost) in rows.flatten() {
+    for row in rows {
+        let (w, hour, n, lost) = row?;
         if let (Some(row), Ok(hour)) = (loss.get_mut(w as usize), usize::try_from(hour))
             && let Some(cell) = row.get_mut(hour)
         {
@@ -400,7 +420,12 @@ fn write_buckets(h: &mut String, buckets: &BTreeMap<String, Bucket>, detailed: b
     let _ = write!(h, "<th>異常次數</th></tr></thead><tbody>");
 
     for (key, b) in buckets {
-        let _ = write!(h, "<tr><td>{key}</td>");
+        // 每小時的鍵是「YYYY-MM-DD HH:00」，顯示成「MM/DD HH:00」
+        let label = match (detailed, key.get(5..7), key.get(8..10), key.get(11..)) {
+            (true, Some(month), Some(day), Some(hour)) => format!("{month}/{day} {hour}"),
+            _ => key.clone(),
+        };
+        let _ = write!(h, "<tr><td>{label}</td>");
         for layer in 0..LAYER_NAMES.len() {
             match b.layers.get(&layer) {
                 Some(c) => {
@@ -528,10 +553,9 @@ fn query_layer_stats(conn: &Connection, since: i64) -> rusqlite::Result<Vec<Laye
             max_ms: r.get(5)?,
         })
     })?;
-    Ok(rows
-        .filter_map(Result::ok)
-        .filter(|s| s.layer < LAYER_NAMES.len())
-        .collect())
+    let mut stats = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    stats.retain(|s| s.layer < LAYER_NAMES.len());
+    Ok(stats)
 }
 
 /// 依 `fmt`（strftime 格式）分時段彙總各種資料
@@ -558,19 +582,14 @@ fn query_buckets(
             },
         ))
     })?;
-    for (key, layer, cell) in rows.flatten() {
+    for row in rows {
+        let (key, layer, cell) = row?;
         map.entry(key).or_default().layers.insert(layer, cell);
     }
 
-    // 以下幾張表在舊版記錄檔可能不存在，失敗就略過
+    // 以下幾張表在舊版記錄檔可能不存在，沒有這張表就略過；其他錯誤（例如檔案損壞）要回報
     let optional = |sql: String, apply: &mut dyn FnMut(&rusqlite::Row) -> rusqlite::Result<()>| {
-        if let Ok(mut stmt) = conn.prepare(&sql)
-            && let Ok(mut rows) = stmt.query([since])
-        {
-            while let Ok(Some(row)) = rows.next() {
-                let _ = apply(row);
-            }
-        }
+        optional_table(for_each_row(conn, &sql, since, apply)).map(drop)
     };
     optional(
         format!(
@@ -580,7 +599,7 @@ fn query_buckets(
             map.entry(r.get(0)?).or_default().wifi = Some((r.get(1)?, r.get(2)?));
             Ok(())
         },
-    );
+    )?;
     optional(
         format!(
             "SELECT {bucket} AS b, SUM(retrans), SUM(timeouts) FROM tcp_stats WHERE ts_ms >= ?1 GROUP BY b"
@@ -589,14 +608,14 @@ fn query_buckets(
             map.entry(r.get(0)?).or_default().tcp = Some((r.get(1)?, r.get(2)?));
             Ok(())
         },
-    );
+    )?;
     optional(
         format!("SELECT {bucket} AS b, COUNT(*) FROM incidents WHERE ts_ms >= ?1 GROUP BY b"),
         &mut |r| {
             map.entry(r.get(0)?).or_default().incidents = r.get(1)?;
             Ok(())
         },
-    );
+    )?;
     Ok(map)
 }
 
@@ -645,7 +664,7 @@ fn query_hops(conn: &Connection, since: i64) -> rusqlite::Result<Vec<HopRow>> {
             avg_ms: r.get(5)?,
         })
     })?;
-    Ok(rows.flatten().collect())
+    rows.collect()
 }
 
 fn query_incidents(conn: &Connection, since: i64) -> rusqlite::Result<Vec<IncidentRow>> {
@@ -661,7 +680,32 @@ fn query_incidents(conn: &Connection, since: i64) -> rusqlite::Result<Vec<Incide
             details: r.get(3)?,
         })
     })?;
-    Ok(rows.flatten().collect())
+    rows.collect()
+}
+
+fn for_each_row(
+    conn: &Connection,
+    sql: &str,
+    since: i64,
+    apply: &mut dyn FnMut(&rusqlite::Row) -> rusqlite::Result<()>,
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query([since])?;
+    while let Some(row) = rows.next()? {
+        apply(row)?;
+    }
+    Ok(())
+}
+
+/// 舊版記錄檔可能還沒有某些資料表：沒有這張表時回傳 None，其他錯誤照常回報
+fn optional_table<T>(result: rusqlite::Result<T>) -> rusqlite::Result<Option<T>> {
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.starts_with("no such table") => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn pct(part: i64, total: i64) -> f64 {

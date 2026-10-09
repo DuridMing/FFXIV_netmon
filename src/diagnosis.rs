@@ -16,6 +16,7 @@ const ISP: usize = 1;
 const INTERNET: usize = 2;
 const GAME: usize = 3;
 
+#[derive(Clone)]
 pub struct LayerState {
     pub has_probe: bool,
     /// 最近一次結果：None = 逾時

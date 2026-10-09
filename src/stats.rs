@@ -60,21 +60,30 @@ impl Window {
     /// 只統計最近 `n` 筆
     pub fn summary_last(&self, n: usize) -> Option<Summary> {
         let skip = self.samples.len().saturating_sub(n);
-        let recent: Vec<Option<u32>> = self.samples.iter().skip(skip).copied().collect();
-        if recent.is_empty() {
-            return None;
-        }
-        let ok: Vec<f64> = recent.iter().flatten().map(|&ms| ms as f64).collect();
-        let lost = recent.len() - ok.len();
-
-        let avg_ms = (!ok.is_empty()).then(|| ok.iter().sum::<f64>() / ok.len() as f64);
-        let jitter_ms = (ok.len() >= 2).then(|| {
-            ok.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>() / (ok.len() - 1) as f64
-        });
-        Some(Summary {
-            avg_ms,
-            jitter_ms,
-            loss_pct: lost as f64 * 100.0 / recent.len() as f64,
-        })
+        summarize(self.samples.iter().skip(skip).copied().collect())
     }
+
+    /// 最新一筆之前的 `n` 筆（不含最新一筆），用來跟最新一筆比較
+    pub fn summary_before_last(&self, n: usize) -> Option<Summary> {
+        let end = self.samples.len().saturating_sub(1);
+        let skip = end.saturating_sub(n);
+        summarize(self.samples.range(skip..end).copied().collect())
+    }
+}
+
+fn summarize(recent: Vec<Option<u32>>) -> Option<Summary> {
+    if recent.is_empty() {
+        return None;
+    }
+    let ok: Vec<f64> = recent.iter().flatten().map(|&ms| ms as f64).collect();
+    let lost = recent.len() - ok.len();
+
+    let avg_ms = (!ok.is_empty()).then(|| ok.iter().sum::<f64>() / ok.len() as f64);
+    let jitter_ms = (ok.len() >= 2)
+        .then(|| ok.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>() / (ok.len() - 1) as f64);
+    Some(Summary {
+        avg_ms,
+        jitter_ms,
+        loss_pct: lost as f64 * 100.0 / recent.len() as f64,
+    })
 }

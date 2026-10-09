@@ -1,25 +1,26 @@
 //! 背景量測執行緒：每 2 秒量測各層延遲，透過 channel 把結果送給介面。
 
+use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
-use crate::detector::{self, GameEvent, GameTracker};
+use crate::detector::{self, GameEvent, GameSnapshot, GameTracker};
 use crate::diagnosis::{self, LayerState};
 use crate::events::{EventDetector, IncidentKind, RECENT};
 use crate::game_tcp::{GameTcpReport, GameTcpTracker, TcpStatus};
 use crate::hops::{HopReport, HopTracker};
 use crate::network::NetworkWatcher;
 use crate::stats::{Summary, Window};
-use crate::storage::{self, Sample, Storage};
+use crate::storage::{self, IncidentRecord, RoundRecord, Sample, Storage};
 use crate::trace::{self, Trace};
+use crate::wifi::{WifiStatus, WifiWatcher};
 use crate::win::elevation;
 use crate::win::icmp::{EchoResult, Icmp};
-use crate::win::netif::NetIf;
+use crate::win::netif::{IfKind, NetIf};
 use crate::win::time;
-use crate::win::wlan::{WifiInfo, Wlan};
 
 pub const INTERVAL: Duration = Duration::from_secs(2);
 const TIMEOUT: Duration = Duration::from_millis(1000);
@@ -27,6 +28,16 @@ pub const INTERNET_TARGET: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
 /// 統計視窗：30 次 × 2 秒 = 60 秒
 pub const WINDOW_SIZE: usize = 30;
 const GAME_TRACE_HOPS: u8 = 20;
+/// 讀不到遊戲連線表時，最多沿用上一輪的結果幾次（3 × 2 秒 = 6 秒），之後才當作遊戲沒有連線
+const MAX_SCAN_FAILURES: u32 = 3;
+/// 每幾輪寫一次記錄檔（30 × 2 秒 = 1 分鐘）；發生異常事件時立刻寫
+const FLUSH_ROUNDS: usize = 30;
+/// 寫入失敗時記憶體裡最多留幾輪（900 × 2 秒 = 30 分鐘），超過就丟掉最舊的
+const MAX_BUFFERED_ROUNDS: usize = 900;
+/// 每幾輪清一次超過保留天數的樣本（1800 × 2 秒 = 1 小時）
+const PRUNE_ROUNDS: usize = 1800;
+/// 結束程式時，最多等背景執行緒多久（寫入記錄檔、或正在做事件的 traceroute）
+const STOP_WAIT: Duration = Duration::from_secs(3);
 
 pub const LAYER_NAMES: [&str; 4] = ["路由器", "ISP", "外部網路", "遊戲伺服器"];
 const GAME: usize = 3;
@@ -41,8 +52,10 @@ pub enum GameStatus {
 
 pub struct LayerReport {
     pub target: Option<String>,
-    /// 本輪結果：None = 沒有目標，Some(None) = 逾時
+    /// 本輪結果：None = 沒有目標或無法量測，Some(None) = 逾時
     pub last: Option<Option<u32>>,
+    /// 本機無法送出量測（例如被防火牆擋住），跟網路逾時不同，不算掉包
+    pub failed: bool,
     pub summary: Option<Summary>,
 }
 
@@ -52,8 +65,7 @@ pub enum MonitorMsg {
     Round {
         /// 從監測開始經過的秒數，給圖表當 X 軸
         elapsed: f64,
-        /// None 代表沒有連 Wi-Fi（有線網路或沒有無線網卡）
-        wifi: Option<WifiInfo>,
+        wifi: WifiStatus,
         game: GameStatus,
         layers: Vec<LayerReport>,
         /// 遊戲連線的 TCP 統計
@@ -67,6 +79,8 @@ pub enum MonitorMsg {
         net_if: Option<NetIf>,
         /// 電腦網路斷線的原因；None 代表網路正常
         network_down: Option<String>,
+        /// 記錄檔寫入失敗的原因；None 代表正常
+        storage_error: Option<String>,
     },
     Event {
         time: String,
@@ -84,6 +98,22 @@ pub struct Incident {
     pub details: Vec<String>,
 }
 
+/// 背景量測執行緒
+pub struct Monitor {
+    pub rx: Receiver<MonitorMsg>,
+    stop: Sender<()>,
+    /// 執行緒結束時會斷開
+    done: Receiver<()>,
+}
+
+impl Drop for Monitor {
+    /// 介面結束（包括畫面出錯要重新啟動）時，通知背景執行緒結束，並等它把還沒寫入的資料寫進記錄檔
+    fn drop(&mut self) {
+        let _ = self.stop.try_send(());
+        let _ = self.done.recv_timeout(STOP_WAIT);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Probe {
     Icmp(Ipv4Addr),
@@ -91,20 +121,43 @@ enum Probe {
     Tcp(SocketAddrV4),
 }
 
-impl Probe {
-    /// 回傳延遲毫秒數；逾時回傳 None
-    fn run(self) -> Option<u32> {
+#[derive(Clone, Copy)]
+enum Measured {
+    Rtt(u32),
+    Lost,
+    /// 本機就失敗了（例如防火牆擋住這個程式連線），跟網路無關
+    Failed,
+}
+
+impl Measured {
+    /// 要放進統計和記錄檔的樣本：None = 不算（無法量測），Some(None) = 逾時
+    fn sample(self) -> Option<Option<u32>> {
         match self {
-            Probe::Icmp(ip) => match Icmp::new().ok()?.echo(ip, None, TIMEOUT) {
-                EchoResult::Reply { rtt_ms } => Some(rtt_ms),
-                _ => None,
+            Measured::Rtt(ms) => Some(Some(ms)),
+            Measured::Lost => Some(None),
+            Measured::Failed => None,
+        }
+    }
+}
+
+impl Probe {
+    fn run(self) -> Measured {
+        match self {
+            Probe::Icmp(ip) => match Icmp::new() {
+                Ok(icmp) => match icmp.echo(ip, None, TIMEOUT) {
+                    EchoResult::Reply { rtt_ms } => Measured::Rtt(rtt_ms),
+                    _ => Measured::Lost,
+                },
+                Err(_) => Measured::Failed,
             },
             Probe::Tcp(addr) => {
                 let start = Instant::now();
                 // 只做 handshake，連上後立刻關閉，不送任何資料
-                TcpStream::connect_timeout(&addr.into(), TIMEOUT)
-                    .ok()
-                    .map(|_| start.elapsed().as_millis() as u32)
+                match TcpStream::connect_timeout(&addr.into(), TIMEOUT) {
+                    Ok(_) => Measured::Rtt(start.elapsed().as_millis() as u32),
+                    Err(e) if is_local_error(&e) => Measured::Failed,
+                    Err(_) => Measured::Lost,
+                }
             }
         }
     }
@@ -115,6 +168,15 @@ impl Probe {
             Probe::Tcp(addr) => addr.to_string(),
         }
     }
+}
+
+/// 連線還沒送出去就失敗：權限被擋（防火牆）、本機資源不足等，不代表網路有問題
+fn is_local_error(e: &std::io::Error) -> bool {
+    // WSAENOBUFS、WSAEMFILE：本機 socket 資源用完
+    matches!(
+        e.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::AddrNotAvailable | ErrorKind::InvalidInput
+    ) || matches!(e.raw_os_error(), Some(10055 | 10024))
 }
 
 struct Layer {
@@ -146,12 +208,119 @@ impl Layer {
     }
 }
 
+/// 遊戲連線全部中斷前一刻的狀態。斷線後連線、統計、中間節點都會被清掉，
+/// 先留下來給「遊戲連線中斷」事件用
+struct Disconnect {
+    game: LayerState,
+    target: Option<String>,
+    tcp: Option<GameTcpReport>,
+    hops: Vec<HopReport>,
+    hop_loss_origin: Option<(u8, Option<Ipv4Addr>)>,
+}
+
+/// 記錄檔寫入：每輪的資料先放在記憶體，每分鐘（或發生事件時）用一個交易寫入，減少硬碟寫入量。
+/// 寫入失敗時資料留在記憶體，下次重新開啟記錄檔再試
+struct Recorder {
+    storage: Option<Storage>,
+    buffer: Vec<RoundRecord>,
+    /// 目前寫入失敗的原因
+    error: Option<String>,
+    rounds_since_prune: usize,
+}
+
+impl Recorder {
+    fn open() -> (Self, (String, bool)) {
+        let (storage, error, event) = match Storage::open() {
+            Ok(s) => {
+                let path = storage::db_path().map_or(String::new(), |p| p.display().to_string());
+                (Some(s), None, (format!("記錄檔：{path}"), false))
+            }
+            Err(e) => (
+                None,
+                Some(e.clone()),
+                (format!("無法開啟記錄檔，每分鐘會再試一次：{e}"), true),
+            ),
+        };
+        let recorder = Self {
+            storage,
+            buffer: Vec::new(),
+            error,
+            rounds_since_prune: 0,
+        };
+        (recorder, event)
+    }
+
+    /// 加入一輪資料；累積夠多或 `now` 為 true 時寫入。回傳要顯示的訊息
+    fn push(&mut self, record: RoundRecord, now: bool) -> Option<(String, bool)> {
+        self.buffer.push(record);
+        self.rounds_since_prune += 1;
+        if now || self.buffer.len() >= FLUSH_ROUNDS {
+            self.flush()
+        } else {
+            None
+        }
+    }
+
+    /// 寫入記憶體裡的資料。寫入失敗或恢復時回傳要顯示的訊息
+    fn flush(&mut self) -> Option<(String, bool)> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        match self.try_flush() {
+            Ok(()) => {
+                self.buffer.clear();
+                self.error
+                    .take()
+                    .map(|_| ("記錄檔恢復寫入".to_string(), false))
+            }
+            Err(e) => {
+                // 下次重新開啟記錄檔再試
+                self.storage = None;
+                if self.buffer.len() > MAX_BUFFERED_ROUNDS {
+                    let excess = self.buffer.len() - MAX_BUFFERED_ROUNDS;
+                    self.buffer.drain(..excess);
+                }
+                let first = self.error.is_none();
+                self.error = Some(e.clone());
+                first.then(|| {
+                    (
+                        format!("寫入記錄檔失敗，每分鐘會再試一次（資料先暫存在記憶體）：{e}"),
+                        true,
+                    )
+                })
+            }
+        }
+    }
+
+    fn try_flush(&mut self) -> Result<(), String> {
+        if self.storage.is_none() {
+            self.storage = Some(Storage::open()?);
+        }
+        let Some(db) = self.storage.as_mut() else {
+            return Ok(());
+        };
+        db.write_rounds(&self.buffer).map_err(|e| e.to_string())?;
+        // 程式常駐好幾天時也要清掉超過保留天數的樣本；清除失敗不影響寫入
+        if self.rounds_since_prune >= PRUNE_ROUNDS {
+            self.rounds_since_prune = 0;
+            let _ = db.prune();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Recorder {
+    /// 程式結束時把還沒寫入的資料寫進去
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
 /// 啟動背景量測。每次送出訊息後會呼叫 `wake` 通知介面重繪。
-pub fn spawn(
-    manual_target: Option<SocketAddrV4>,
-    wake: impl Fn() + Send + 'static,
-) -> Receiver<MonitorMsg> {
+pub fn spawn(manual_target: Option<SocketAddrV4>, wake: impl Fn() + Send + 'static) -> Monitor {
     let (tx, rx) = crossbeam_channel::unbounded();
+    let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(0);
     thread::spawn(move || {
         let send = |msg| {
             // 介面關閉後 channel 會斷開，此時直接結束執行緒
@@ -161,9 +330,15 @@ pub fn spawn(
             wake();
             true
         };
-        run(manual_target, &send);
+        run(manual_target, &send, &stop_rx);
+        // 執行緒結束（記錄檔已經寫完）才斷開，讓 Monitor::stop 知道可以結束了
+        drop(done_tx);
     });
-    rx
+    Monitor {
+        rx,
+        stop: stop_tx,
+        done: done_rx,
+    }
 }
 
 fn event(text: impl Into<String>, severe: bool) -> MonitorMsg {
@@ -174,19 +349,14 @@ fn event(text: impl Into<String>, severe: bool) -> MonitorMsg {
     }
 }
 
-fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
-    let mut storage = match Storage::open() {
-        Ok(s) => {
-            if let Some(path) = storage::db_path() {
-                send(event(format!("記錄檔：{}", path.display()), false));
-            }
-            Some(s)
-        }
-        Err(e) => {
-            send(event(format!("無法開啟記錄檔，這次不會存檔：{e}"), true));
-            None
-        }
-    };
+fn run(
+    manual_target: Option<SocketAddrV4>,
+    send: &dyn Fn(MonitorMsg) -> bool,
+    stop: &Receiver<()>,
+) {
+    // 函式結束（不論從哪裡 return）時，Recorder 會把剩下的資料寫進記錄檔
+    let (mut recorder, (text, severe)) = Recorder::open();
+    send(event(text, severe));
 
     send(MonitorMsg::Status(format!(
         "尋找路由器，並追蹤路由到 {INTERNET_TARGET} 尋找 ISP 節點..."
@@ -195,9 +365,9 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
     send(event(
         match network.gateway {
             Some(g) => format!("路由器：{g}"),
-            None => "找不到預設閘道".into(),
+            None => "找不到路由器（電腦直接撥號、使用 VPN，或目前沒有網路）".into(),
         },
-        network.gateway.is_none(),
+        false,
     ));
     send(event(
         match network.isp {
@@ -224,20 +394,35 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
     let mut detector = EventDetector::default();
     // 斷線後連線表裡就沒有伺服器了，traceroute 要用最後一次看到的位址
     let mut last_game_target = manual_target;
-    let wlan = Wlan::open();
-    let mut last_wifi: Option<WifiInfo> = None;
+    let mut last_snapshot = GameSnapshot::default();
+    let mut scan_failures = 0;
+    let mut wifi_watcher = WifiWatcher::default();
+    let mut last_wifi = WifiStatus::NotUsed;
     let elevated = elevation::is_elevated();
     let mut game_tcp = GameTcpTracker::default();
+    // 上一輪的遊戲連線 TCP 統計：連線關閉後就讀不到了
+    let mut last_tcp_report: Option<GameTcpReport> = None;
     let mut hop_tracker = HopTracker::default();
+    let mut disconnect: Option<Disconnect> = None;
     loop {
         let round_start = Instant::now();
 
         let mut game_disconnected = false;
-        // 斷線時遊戲層的視窗會被清掉，先留下斷線前的狀態給診斷用
-        let mut game_before = None;
         let mut game_conn = None;
         if manual_target.is_none() {
-            let snapshot = detector::scan();
+            let snapshot = match detector::scan() {
+                Some(s) => {
+                    scan_failures = 0;
+                    last_snapshot = s.clone();
+                    s
+                }
+                // Windows API 偶爾會暫時失敗，不能直接當成遊戲關閉或斷線
+                None if scan_failures < MAX_SCAN_FAILURES => {
+                    scan_failures += 1;
+                    last_snapshot.clone()
+                }
+                None => GameSnapshot::default(),
+            };
             for ev in tracker.update(&snapshot) {
                 let (text, severe) = match ev {
                     GameEvent::Started => ("偵測到遊戲程序".to_string(), false),
@@ -246,7 +431,13 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
                     GameEvent::TargetChanged(t) => (format!("原連線已結束，改監測 {t}"), false),
                     GameEvent::AllConnectionsLost => {
                         game_disconnected = true;
-                        game_before = Some(layers[GAME].state());
+                        disconnect = Some(Disconnect {
+                            game: layers[GAME].state(),
+                            target: layers[GAME].probe.map(Probe::target),
+                            tcp: last_tcp_report,
+                            hops: hop_tracker.reports(),
+                            hop_loss_origin: hop_tracker.loss_origin(),
+                        });
                         continue;
                     }
                 };
@@ -260,12 +451,17 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
                 game_conn = snapshot.conn_to(t);
             }
         }
-        // 中間節點追蹤跟著目前的遊戲伺服器（手動目標也算）
-        hop_tracker.set_target(manual_target.or(tracker.target()).map(|t| *t.ip()));
+        // 中間節點追蹤跟著目前的遊戲伺服器（手動目標也算）；換目標時舊目標不滿一分鐘的資料也要寫入
+        let mut hop_records = Vec::new();
+        if let Some((old, agg)) =
+            hop_tracker.set_target(manual_target.or(tracker.target()).map(|t| *t.ip()))
+        {
+            hop_records.push((old.to_string(), agg));
+        }
 
         // 各層和中間節點同時量測，一輪最多花 TIMEOUT 的時間
         let hop_probe = hop_tracker.target().map(|t| (t, hop_tracker.probe_hops()));
-        let (results, hop_trace): (Vec<Option<Option<u32>>>, Option<Trace>) = thread::scope(|s| {
+        let (results, hop_trace): (Vec<Option<Measured>>, Option<Trace>) = thread::scope(|s| {
             let hop_handle = hop_probe.map(|(t, n)| s.spawn(move || trace::traceroute(t, n)));
             let handles: Vec<_> = layers
                 .iter()
@@ -273,16 +469,47 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
                 .collect();
             let results = handles
                 .into_iter()
-                .map(|h| h.map(|h| h.join().unwrap_or(None)))
+                .map(|h| h.map(|h| h.join().unwrap_or(Measured::Failed)))
                 .collect();
             (results, hop_handle.and_then(|h| h.join().ok()))
         });
-        let hop_minute = hop_trace.as_ref().and_then(|t| hop_tracker.record(t));
+
+        // 結果要記到量測當時的目標：先寫進統計，之後才更新路由器／ISP 節點
+        let ts_ms = storage::now_ms();
+        let targets: Vec<Option<String>> =
+            layers.iter().map(|l| l.probe.map(Probe::target)).collect();
+        for (layer, result) in layers.iter_mut().zip(&results) {
+            if let Some(sample) = result.and_then(Measured::sample) {
+                layer.window.push(sample);
+            }
+        }
+        let samples: Vec<Sample> = targets
+            .iter()
+            .zip(&results)
+            .enumerate()
+            .filter_map(|(i, (target, result))| {
+                Some(Sample {
+                    layer: i,
+                    target: target.clone()?,
+                    rtt_ms: result.and_then(Measured::sample)?,
+                })
+            })
+            .collect();
+
+        let game_reachable = matches!(results[GAME], Some(Measured::Rtt(_)));
+        if let Some(agg) = hop_trace
+            .as_ref()
+            .and_then(|t| hop_tracker.record(t, game_reachable))
+            && let Some(t) = hop_tracker.target()
+        {
+            hop_records.push((t.to_string(), agg));
+        }
         let tcp = game_tcp.update(game_conn, elevated);
         let tcp_report = match tcp {
             TcpStatus::Stats(r) => Some(r),
             _ => None,
         };
+        last_tcp_report = tcp_report;
 
         let net = network.update();
         for (text, severe) in &net.events {
@@ -295,101 +522,86 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
             layers[1].set_probe(network.isp.map(Probe::Icmp));
         }
 
-        let wifi = wlan.as_ref().and_then(Wlan::current);
-        let wifi_event = match (&last_wifi, &wifi) {
-            (None, Some(w)) => Some((format!("Wi-Fi：{}，訊號 {}%", w.ssid, w.quality), false)),
-            (Some(old), None) => Some((format!("Wi-Fi 連線中斷（{}）", old.ssid), true)),
-            (Some(old), Some(w)) if old.ssid != w.ssid => {
-                Some((format!("Wi-Fi 換成 {}，訊號 {}%", w.ssid, w.quality), false))
-            }
-            _ => None,
-        };
-        if let Some((text, severe)) = wifi_event
+        let wifi = wifi_watcher.update(net.net_if.as_ref());
+        if let Some((text, severe)) = wifi_event(&last_wifi, &wifi)
             && !send(event(text, severe))
         {
             return;
         }
         last_wifi = wifi.clone();
 
-        let ts_ms = storage::now_ms();
-        let targets: Vec<Option<String>> =
-            layers.iter().map(|l| l.probe.map(Probe::target)).collect();
-        for (layer, last) in layers.iter_mut().zip(&results) {
-            if let Some(r) = *last {
-                layer.window.push(r);
-            }
-        }
-
-        if let Some(db) = &mut storage {
-            let samples: Vec<Sample> = targets
-                .iter()
-                .zip(&results)
-                .enumerate()
-                .filter_map(|(i, (target, last))| {
-                    Some(Sample {
-                        layer: i,
-                        target: target.as_deref()?,
-                        rtt_ms: (*last)?,
-                    })
-                })
-                .collect();
-            let result = db
-                .record_round(ts_ms, &samples, wifi.as_ref())
-                .and_then(|()| match (tcp_report, last_game_target) {
-                    (Some(r), Some(t)) => db.record_tcp(ts_ms, &t.to_string(), &r),
-                    _ => Ok(()),
-                })
-                .and_then(|()| match (&hop_minute, hop_tracker.target()) {
-                    (Some(agg), Some(t)) => db.record_hops(ts_ms, &t.to_string(), agg),
-                    _ => Ok(()),
-                });
-            if let Err(e) = result {
-                send(event(format!("寫入記錄檔失敗，停止存檔：{e}"), true));
-                storage = None;
-            }
-        }
-
         let windows = [0, 1, 2, 3].map(|i| &layers[i].window);
         let hop_reports = hop_tracker.reports();
         let hop_loss_origin = hop_tracker.loss_origin();
-        if let Some(kind) =
-            detector.check(windows, game_disconnected, net.signal, tcp_report.as_ref())
-        {
+        let kind = detector.check(windows, game_disconnected, net.signal, tcp_report.as_ref());
+        let mut incident_record = None;
+        if let Some(kind) = kind {
             let mut states = [0, 1, 2, 3].map(|i| layers[i].state());
-            if let Some(before) = game_before {
-                states[GAME] = before;
-            }
-            let extra = IncidentExtra {
+            let mut targets = targets.clone();
+            let mut extra = IncidentExtra {
                 net_if: net.net_if.as_ref(),
                 network_down: net.down_reason.as_deref(),
-                wifi: wifi.as_ref(),
+                wifi: &wifi,
                 tcp: tcp_report,
                 hops: &hop_reports,
                 hop_loss_origin,
             };
-            let incident = build_incident(kind, &states, &targets, last_game_target, &extra);
-            if let Some(db) = &storage {
-                // 事件寫入失敗不影響監測；資料庫真的壞了，下一輪寫樣本時會回報
-                let _ = db.record_incident(
-                    ts_ms,
-                    &kind.code(),
-                    &incident.title,
-                    &incident.diagnosis,
-                    &incident.details.join("\n"),
-                );
+            // 遊戲斷線（或同一輪的網路中斷）：遊戲層和中間節點用斷線前的狀態
+            if let Some(d) = disconnect.as_ref().filter(|_| {
+                matches!(
+                    kind,
+                    IncidentKind::GameDisconnected | IncidentKind::NetworkDown
+                )
+            }) {
+                states[GAME] = d.game.clone();
+                targets[GAME] = d.target.clone();
+                if kind == IncidentKind::GameDisconnected {
+                    extra.tcp = d.tcp;
+                    extra.hops = &d.hops;
+                    extra.hop_loss_origin = d.hop_loss_origin;
+                }
             }
+            let incident = build_incident(kind, &states, &targets, last_game_target, &extra);
+            incident_record = Some(IncidentRecord {
+                kind: kind.code(),
+                title: incident.title.clone(),
+                diagnosis: incident.diagnosis.clone(),
+                details: incident.details.join("\n"),
+            });
             if !send(MonitorMsg::Incident(incident)) {
                 return;
             }
+        }
+        // 網路中斷那一輪的遊戲斷線會留到下一輪回報，其他情況用完就丟掉
+        if kind != Some(IncidentKind::NetworkDown) {
+            disconnect = None;
+        }
+
+        let flush_now = incident_record.is_some();
+        let record = RoundRecord {
+            ts_ms,
+            samples,
+            wifi: wifi.info().cloned(),
+            tcp: tcp_report
+                .zip(last_game_target)
+                .map(|(r, t)| (t.to_string(), r)),
+            hops: hop_records,
+            incident: incident_record,
+        };
+        if let Some((text, severe)) = recorder.push(record, flush_now)
+            && !send(event(text, severe))
+        {
+            return;
         }
 
         let reports = layers
             .iter()
             .zip(targets)
             .zip(results)
-            .map(|((layer, target), last)| LayerReport {
+            .map(|((layer, target), result)| LayerReport {
                 target,
-                last,
+                last: result.and_then(Measured::sample),
+                failed: matches!(result, Some(Measured::Failed)),
                 summary: layer.window.summary(),
             })
             .collect();
@@ -412,11 +624,46 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
             hop_loss_origin,
             net_if: net.net_if,
             network_down: net.down_reason,
+            storage_error: recorder.error.clone(),
         }) {
             return;
         }
 
-        thread::sleep(INTERVAL.saturating_sub(round_start.elapsed()));
+        // 等到下一輪；程式要結束時會立刻醒來
+        match stop.recv_timeout(INTERVAL.saturating_sub(round_start.elapsed())) {
+            Err(RecvTimeoutError::Timeout) => {}
+            _ => return,
+        }
+    }
+}
+
+/// Wi-Fi 狀態變化時要顯示的訊息
+fn wifi_event(old: &WifiStatus, new: &WifiStatus) -> Option<(String, bool)> {
+    match (old, new) {
+        (WifiStatus::Connected(o), WifiStatus::Connected(w)) => {
+            (o.ssid.is_some() && w.ssid.is_some() && o.ssid != w.ssid).then(|| {
+                (
+                    format!("Wi-Fi 換成 {}，訊號 {}%", w.ssid_text(), w.quality),
+                    false,
+                )
+            })
+        }
+        (_, WifiStatus::Connected(w)) => Some((
+            format!("Wi-Fi：{}，訊號 {}%", w.ssid_text(), w.quality),
+            false,
+        )),
+        (WifiStatus::Connected(o), WifiStatus::Disconnected) => {
+            let name = o
+                .ssid
+                .as_ref()
+                .map(|s| format!("（{s}）"))
+                .unwrap_or_default();
+            Some((format!("Wi-Fi 連線中斷{name}"), true))
+        }
+        (_, WifiStatus::Unreadable(reason)) if old != new => {
+            Some((format!("無法讀取 Wi-Fi 資訊：{reason}"), false))
+        }
+        _ => None,
     }
 }
 
@@ -425,7 +672,7 @@ struct IncidentExtra<'a> {
     net_if: Option<&'a NetIf>,
     /// 電腦網路斷線的原因；None 代表網路正常
     network_down: Option<&'a str>,
-    wifi: Option<&'a WifiInfo>,
+    wifi: &'a WifiStatus,
     tcp: Option<GameTcpReport>,
     hops: &'a [HopReport],
     hop_loss_origin: Option<(u8, Option<Ipv4Addr>)>,
@@ -438,7 +685,6 @@ fn build_incident(
     game_target: Option<SocketAddrV4>,
     extra: &IncidentExtra,
 ) -> Incident {
-    let wifi = extra.wifi;
     let involves_game = matches!(
         kind,
         IncidentKind::GameDisconnected
@@ -463,10 +709,9 @@ fn build_incident(
     if let Some(reason) = extra.network_down {
         details.push(format!("電腦網路：中斷，{reason}"));
     }
-    details.push(match wifi {
-        Some(w) => format!("Wi-Fi：{}，訊號 {}%", w.ssid, w.quality),
-        None => "Wi-Fi：沒有使用（有線網路）".into(),
-    });
+    if let Some(line) = wifi_detail(extra.wifi, extra.net_if) {
+        details.push(line);
+    }
     if let Some(t) = &extra.tcp {
         details.push(format!(
             "遊戲連線 TCP：實際延遲 {} ms（變動 {} ms），近 20 秒重傳 {} 個封包、逾時 {} 次，近 60 秒重傳 {} 個、逾時 {} 次",
@@ -489,7 +734,7 @@ fn build_incident(
 
     let ctx = diagnosis::Context {
         trace: trace.as_ref(),
-        wifi_quality: wifi.map(|w| w.quality),
+        wifi_quality: extra.wifi.info().map(|w| w.quality),
         hop_loss_origin: extra.hop_loss_origin,
         net_if: extra.net_if,
         network_down: extra.network_down,
@@ -500,6 +745,19 @@ fn build_incident(
         title: kind.title(),
         diagnosis: diagnosis::diagnose(kind, states, &ctx),
         details,
+    }
+}
+
+/// 事件詳情的 Wi-Fi 那一行，要跟網路卡的種類一致
+fn wifi_detail(wifi: &WifiStatus, net_if: Option<&NetIf>) -> Option<String> {
+    match wifi {
+        WifiStatus::Connected(w) => Some(format!("Wi-Fi：{}，訊號 {}%", w.ssid_text(), w.quality)),
+        WifiStatus::Disconnected => Some("Wi-Fi：沒有連線".into()),
+        WifiStatus::Unreadable(reason) => Some(format!("Wi-Fi：無法讀取（{reason}）")),
+        WifiStatus::NotUsed => match net_if.map(|n| n.kind) {
+            Some(IfKind::Ethernet) => Some("Wi-Fi：沒有使用（有線網路）".into()),
+            _ => None,
+        },
     }
 }
 
@@ -549,4 +807,62 @@ fn trace_lines(t: &Trace) -> Vec<String> {
             _ => format!("  {:>2}  *", h.ttl),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wifi::WifiInfo;
+
+    fn net_if(kind: IfKind) -> NetIf {
+        NetIf {
+            index: 1,
+            guid: 0,
+            alias: "x".into(),
+            description: "x".into(),
+            kind,
+            admin_down: false,
+            media_connected: kind != IfKind::Wifi,
+            oper_up: true,
+            speed_bps: 0,
+        }
+    }
+
+    #[test]
+    fn wifi_detail_matches_adapter_kind() {
+        let wifi = net_if(IfKind::Wifi);
+        let wired = net_if(IfKind::Ethernet);
+        assert_eq!(
+            wifi_detail(&WifiStatus::Disconnected, Some(&wifi)).as_deref(),
+            Some("Wi-Fi：沒有連線")
+        );
+        assert_eq!(
+            wifi_detail(&WifiStatus::NotUsed, Some(&wired)).as_deref(),
+            Some("Wi-Fi：沒有使用（有線網路）")
+        );
+        assert_eq!(
+            wifi_detail(&WifiStatus::NotUsed, Some(&net_if(IfKind::Other))),
+            None
+        );
+    }
+
+    #[test]
+    fn wifi_events() {
+        let a = WifiStatus::Connected(WifiInfo {
+            ssid: Some("A".into()),
+            quality: 80,
+        });
+        let hidden = WifiStatus::Connected(WifiInfo {
+            ssid: None,
+            quality: 80,
+        });
+        assert!(wifi_event(&WifiStatus::NotUsed, &a).is_some());
+        assert!(wifi_event(&a, &a).is_none());
+        assert!(wifi_event(&a, &hidden).is_none());
+        assert!(wifi_event(&a, &WifiStatus::Disconnected).is_some_and(|(_, severe)| severe));
+        // 權限被收回不是斷線
+        let denied = WifiStatus::Unreadable(crate::wifi::NEED_LOCATION);
+        assert!(wifi_event(&a, &denied).is_some_and(|(_, severe)| !severe));
+        assert!(wifi_event(&denied, &denied).is_none());
+    }
 }
