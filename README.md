@@ -59,7 +59,7 @@ FF14 繁中服常常斷線。這個 Windows 小程式會持續監測連線，在
   - `IcmpSendEcho`：ICMP ping，不需要系統管理員權限
   - `GetExtendedTcpTable`：找出遊戲連線
 - 資料儲存：SQLite（`rusqlite`）
-- 大小：單一 exe，約 8 MB，不需要另外安裝任何東西
+- 大小：單一 exe，約 8 MB（上限 10 MB），不需要另外安裝任何東西
 
 ## 開發環境設定
 
