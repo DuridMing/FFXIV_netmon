@@ -6,6 +6,7 @@ use crate::events::IncidentKind;
 use crate::monitor::LAYER_NAMES;
 use crate::stats::Summary;
 use crate::trace::Trace;
+use crate::win::netif::NetIf;
 
 /// 近期掉包率超過這個值，或最近一次逾時，就算這層有問題
 const BAD_LOSS: f64 = 20.0;
@@ -45,6 +46,8 @@ pub struct Context<'a> {
     pub hop_loss_origin: Option<(u8, Option<Ipv4Addr>)>,
     /// 遊戲連線近 20 秒的重傳封包數；沒有系統管理員權限時為 None
     pub retrans_recent: Option<u32>,
+    /// 上網用的網卡；網路中斷時是最後一張用過的網卡
+    pub net_if: Option<&'a NetIf>,
 }
 
 pub fn diagnose(kind: IncidentKind, layers: &[LayerState; 4], ctx: &Context) -> String {
@@ -63,6 +66,17 @@ pub fn diagnose(kind: IncidentKind, layers: &[LayerState; 4], ctx: &Context) -> 
 }
 
 fn diagnose_network(kind: IncidentKind, layers: &[LayerState; 4], ctx: &Context) -> String {
+    if kind == IncidentKind::NetworkDown {
+        return match ctx.net_if {
+            Some(n) => format!(
+                "電腦本身的網路斷了：{}（{}）。請檢查網路線是否鬆脫、Wi-Fi 是否斷線，或網路卡是否被停用。",
+                n.alias,
+                n.down_reason()
+            ),
+            None => "電腦本身的網路斷了：找不到可以上網的網路卡。請檢查網路線、Wi-Fi 或網路設定。"
+                .into(),
+        };
+    }
     if let IncidentKind::LatencySpike(i) = kind {
         return spike_diagnosis(i);
     }

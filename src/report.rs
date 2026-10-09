@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use rusqlite::{Connection, OpenFlags};
 
+use crate::VERSION;
 use crate::monitor::LAYER_NAMES;
 use crate::storage;
 use crate::win::{shell, time};
@@ -234,7 +235,7 @@ fn build_html(conn: &Connection, since: i64, hours: u32) -> rusqlite::Result<Str
 
     let _ = write!(
         h,
-        "<p class=meta>由 ff14-netmon 產生。延遲：路由器、ISP、外部網路、中間節點為 ICMP ping；\
+        "<p class=meta>由 ff14-netmon v{VERSION} 產生。延遲：路由器、ISP、外部網路、中間節點為 ICMP ping；\
          遊戲伺服器為 TCP 連線建立時間；遊戲連線 TCP 統計為 Windows 對遊戲那條連線的實際量測\
          （需要以系統管理員身分執行）。</p></main></body></html>"
     );

@@ -14,12 +14,13 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DispatchMessageW, GetCursorPos, GetMessageW, HICON, MF_STRING, MSG, RegisterClassW,
-    RegisterWindowMessageW, SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+    AppendMenuW, ChangeWindowMessageFilterEx, CreateIcon, CreatePopupMenu, CreateWindowExW,
+    DefWindowProcW, DestroyMenu, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, HICON,
+    MF_STRING, MSG, MSGFLT_ALLOW, PostMessageW, RegisterClassW, RegisterWindowMessageW,
+    SetForegroundWindow, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
 };
-use windows::core::w;
+use windows::core::{PCWSTR, w};
 
 use crate::icon::{self, Health};
 
@@ -29,6 +30,8 @@ pub enum TrayCommand {
 }
 
 const WM_TRAY: u32 = WM_APP + 1;
+const TRAY_CLASS: PCWSTR = w!("ff14-netmon-tray");
+const TRAY_TITLE: PCWSTR = w!("FF14 連線監測");
 const ICON_ID: u32 = 1;
 const MENU_SHOW: usize = 1;
 const MENU_EXIT: usize = 2;
@@ -63,7 +66,7 @@ pub fn spawn(tip: &str, handler: impl Fn(TrayCommand) + Send + Sync + 'static) -
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || unsafe {
         let hinstance = GetModuleHandleW(None).ok().map(|h| HINSTANCE(h.0));
-        let class = w!("ff14-netmon-tray");
+        let class = TRAY_CLASS;
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance.unwrap_or_default(),
@@ -75,7 +78,7 @@ pub fn spawn(tip: &str, handler: impl Fn(TrayCommand) + Send + Sync + 'static) -
         let Ok(hwnd) = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
-            w!("FF14 連線監測"),
+            TRAY_TITLE,
             WINDOW_STYLE(0),
             0,
             0,
@@ -93,6 +96,9 @@ pub fn spawn(tip: &str, handler: impl Fn(TrayCommand) + Send + Sync + 'static) -
             RegisterWindowMessageW(w!("TaskbarCreated")),
             Ordering::Relaxed,
         );
+        // 這個程式以系統管理員身分執行時，一般權限的程式送來的訊息預設會被 UIPI 擋掉；
+        // 開放「點圖示」這個訊息，重複開啟時才叫得出這個視窗
+        let _ = ChangeWindowMessageFilterEx(hwnd, WM_TRAY, MSGFLT_ALLOW, None);
 
         let tray = Tray {
             hwnd: hwnd.0 as isize,
@@ -172,6 +178,22 @@ impl Tray {
         unsafe {
             let _ = Shell_NotifyIconW(NIM_DELETE, &self.data());
         }
+    }
+}
+
+/// 通知已經在執行的那個程式把視窗叫出來（模擬點一下它的系統匣圖示）。找不到時回傳 false
+pub fn show_existing() -> bool {
+    unsafe {
+        let Ok(hwnd) = FindWindowW(TRAY_CLASS, TRAY_TITLE) else {
+            return false;
+        };
+        PostMessageW(
+            Some(hwnd),
+            WM_TRAY,
+            WPARAM(0),
+            LPARAM(WM_LBUTTONUP as isize),
+        )
+        .is_ok()
     }
 }
 

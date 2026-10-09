@@ -16,6 +16,7 @@ use crate::storage::{self, Sample, Storage};
 use crate::trace::{self, Trace};
 use crate::win::elevation;
 use crate::win::icmp::{EchoResult, Icmp};
+use crate::win::netif::{self, NetIf};
 use crate::win::wlan::{WifiInfo, Wlan};
 use crate::win::{route, time};
 
@@ -63,6 +64,9 @@ pub enum MonitorMsg {
         hops: Vec<HopReport>,
         /// 持續掉包的起點：(跳數, 位址)
         hop_loss_origin: Option<(u8, Option<Ipv4Addr>)>,
+        /// 目前上網用的網卡；網路中斷時是最後一張用過的網卡
+        net_if: Option<NetIf>,
+        network_up: bool,
     },
     Event {
         time: String,
@@ -185,7 +189,7 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
     };
 
     send(MonitorMsg::Status("尋找路由器...".into()));
-    let gateway = route::next_hop(INTERNET_TARGET);
+    let mut gateway = route::next_hop(INTERNET_TARGET);
     send(event(
         match gateway {
             Some(g) => format!("路由器：{g}"),
@@ -197,7 +201,7 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
     send(MonitorMsg::Status(format!(
         "追蹤路由到 {INTERNET_TARGET}，尋找 ISP 節點..."
     )));
-    let isp = find_isp_hop(gateway);
+    let mut isp = find_isp_hop(gateway);
     send(event(
         match isp {
             Some(h) => format!("ISP 節點：{h}"),
@@ -228,6 +232,9 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
     let elevated = elevation::is_elevated();
     let mut game_tcp = GameTcpTracker::default();
     let mut hop_tracker = HopTracker::default();
+    // 上一輪用的網卡，網路斷掉時用來查是哪張網卡、為什麼斷
+    let mut last_if: Option<NetIf> = None;
+    let mut network_was_up = true;
     loop {
         let round_start = Instant::now();
 
@@ -282,6 +289,49 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
             TcpStatus::Stats(r) => Some(r),
             _ => None,
         };
+
+        // 網卡狀態：沒有對外路由（網路線拔掉、Wi-Fi 斷線）時，改查上一輪那張網卡，才知道斷線原因
+        let route_if = netif::best_interface(INTERNET_TARGET);
+        let net_if = route_if
+            .and_then(netif::interface)
+            .or_else(|| last_if.as_ref().and_then(|n| netif::interface(n.index)));
+        let network_up = route_if.is_some() && net_if.as_ref().is_some_and(NetIf::connected);
+        let net_event = match (&last_if, &net_if) {
+            (_, Some(n)) if network_up && !network_was_up => {
+                Some((format!("網路連線恢復：{}", n.summary()), false))
+            }
+            (Some(old), Some(n)) if network_up && old.index != n.index => {
+                Some((format!("改用 {} 上網", n.summary()), false))
+            }
+            _ => None,
+        };
+        if let Some((text, severe)) = net_event
+            && !send(event(text, severe))
+        {
+            return;
+        }
+        // 換網卡或換路由器後，重新找路由器和 ISP 節點；不然會一直量舊的目標
+        if network_up {
+            let new_gateway = route::next_hop(INTERNET_TARGET);
+            if new_gateway.is_some() && new_gateway != gateway {
+                gateway = new_gateway;
+                isp = find_isp_hop(gateway);
+                layers[0].set_probe(gateway.map(Probe::Icmp));
+                layers[1].set_probe(isp.map(Probe::Icmp));
+                let text = format!(
+                    "路由器變更為 {}，ISP 節點：{}",
+                    gateway.map_or("-".into(), |g| g.to_string()),
+                    isp.map_or("找不到".into(), |h| h.to_string())
+                );
+                if !send(event(text, false)) {
+                    return;
+                }
+            }
+        }
+        if net_if.is_some() {
+            last_if = net_if.clone();
+        }
+        network_was_up = network_up;
 
         let wifi = wlan.as_ref().and_then(Wlan::current);
         let wifi_event = match (&last_wifi, &wifi) {
@@ -340,12 +390,15 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
         let windows = [0, 1, 2, 3].map(|i| &layers[i].window);
         let hop_reports = hop_tracker.reports();
         let hop_loss_origin = hop_tracker.loss_origin();
-        if let Some(kind) = detector.check(windows, game_disconnected, tcp_report.as_ref()) {
+        if let Some(kind) =
+            detector.check(windows, game_disconnected, network_up, tcp_report.as_ref())
+        {
             let mut states = [0, 1, 2, 3].map(|i| layers[i].state());
             if let Some(before) = game_before {
                 states[GAME] = before;
             }
             let extra = IncidentExtra {
+                net_if: net_if.as_ref(),
                 wifi: wifi.as_ref(),
                 tcp: tcp_report,
                 hops: &hop_reports,
@@ -394,6 +447,8 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
             hop_target: hop_tracker.target(),
             hops: hop_reports,
             hop_loss_origin,
+            net_if,
+            network_up,
         }) {
             return;
         }
@@ -404,6 +459,7 @@ fn run(manual_target: Option<SocketAddrV4>, send: &dyn Fn(MonitorMsg) -> bool) {
 
 /// 事件發生當下的其他資訊，寫進事件詳情、也給診斷參考
 struct IncidentExtra<'a> {
+    net_if: Option<&'a NetIf>,
     wifi: Option<&'a WifiInfo>,
     tcp: Option<GameTcpReport>,
     hops: &'a [HopReport],
@@ -436,6 +492,18 @@ fn build_incident(
         .enumerate()
         .map(|(i, s)| layer_detail(i, s, targets.get(i).cloned().flatten()))
         .collect();
+    if let Some(n) = extra.net_if {
+        let state = if n.connected() {
+            "已連線".to_string()
+        } else {
+            n.down_reason().to_string()
+        };
+        details.push(format!(
+            "網路卡：{}（{}），{state}",
+            n.summary(),
+            n.description
+        ));
+    }
     details.push(match wifi {
         Some(w) => format!("Wi-Fi：{}，訊號 {}%", w.ssid, w.quality),
         None => "Wi-Fi：沒有使用（有線網路）".into(),
@@ -464,6 +532,7 @@ fn build_incident(
         trace: trace.as_ref(),
         wifi_quality: wifi.map(|w| w.quality),
         hop_loss_origin: extra.hop_loss_origin,
+        net_if: extra.net_if,
         retrans_recent: extra.tcp.map(|t| t.retrans_recent),
     };
     Incident {

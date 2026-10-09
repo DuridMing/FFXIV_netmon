@@ -37,7 +37,13 @@ pub fn restart_as_admin() -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    let args: Vec<String> = std::env::args().skip(1).map(|a| quote(&a)).collect();
+    // 加上 --restarted：新的程式會等這個結束後才開始，不會被當成重複開啟
+    let mut args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != "--restarted")
+        .map(|a| quote(&a))
+        .collect();
+    args.push("--restarted".into());
     let exe = HSTRING::from(exe.as_os_str());
     let args = HSTRING::from(args.join(" "));
     // ShellExecute 成功時回傳值大於 32

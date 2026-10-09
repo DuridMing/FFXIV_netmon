@@ -15,6 +15,7 @@ use crate::monitor::{GameStatus, Incident, LAYER_NAMES, LayerReport, MonitorMsg,
 use crate::report::{self, Exported};
 use crate::settings::{CloseAction, Settings};
 use crate::storage;
+use crate::win::netif::NetIf;
 use crate::win::tray::{Tray, TrayCommand};
 use crate::win::wlan::WifiInfo;
 use crate::win::{elevation, time};
@@ -27,7 +28,16 @@ const CHART_SPAN_SECS: f64 = 600.0;
 const CHART_MIN_Y_MS: f64 = 10.0;
 const MAX_EVENTS: usize = 500;
 const GAME_LAYER: usize = 3;
-const FONT_PATH: &str = r"C:\Windows\Fonts\msjh.ttc";
+/// 中文字型候選，依序嘗試（都在 Windows 字型資料夾）。
+/// 繁中版 Windows 有微軟正黑體；其他語言版本不一定有，就退而求其次用其他含中文字的字型
+const FONT_CANDIDATES: [(&str, &str); 6] = [
+    ("msjh.ttc", "微軟正黑體"),
+    ("msyh.ttc", "微軟雅黑"),
+    ("mingliu.ttc", "細明體"),
+    ("simsun.ttc", "新宋體"),
+    ("YuGothM.ttc", "Yu Gothic"),
+    ("meiryo.ttc", "Meiryo"),
+];
 /// 低於這個 Wi-Fi 訊號就用黃色提醒
 const WEAK_WIFI: u32 = 50;
 
@@ -70,6 +80,8 @@ pub struct App {
     game: Option<GameStatus>,
     layers: Vec<LayerReport>,
     wifi: Option<WifiInfo>,
+    net_if: Option<NetIf>,
+    network_up: bool,
     tcp: Option<TcpStatus>,
     hop_target: Option<std::net::Ipv4Addr>,
     hops: Vec<HopReport>,
@@ -102,7 +114,7 @@ impl App {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         rx: Receiver<MonitorMsg>,
-        startup_error: Option<String>,
+        startup_events: Vec<(String, bool)>,
         tray: Option<Tray>,
         tray_rx: Receiver<TrayCommand>,
     ) -> Self {
@@ -112,6 +124,8 @@ impl App {
             game: None,
             layers: Vec::new(),
             wifi: None,
+            net_if: None,
+            network_up: true,
             tcp: None,
             hop_target: None,
             hops: Vec::new(),
@@ -131,8 +145,18 @@ impl App {
             confirm_clear: false,
             clear_rx: None,
         };
-        if !load_system_font(&cc.egui_ctx) {
-            app.push_event(String::new(), format!("找不到中文字型 {FONT_PATH}"), true);
+        match load_system_font(&cc.egui_ctx) {
+            Some(0) => {}
+            Some(i) => app.push_event(
+                String::new(),
+                format!("找不到微軟正黑體，改用{}", FONT_CANDIDATES[i].1),
+                false,
+            ),
+            None => app.push_event(
+                String::new(),
+                "找不到可以顯示中文的字型，中文可能會顯示成方框".into(),
+                true,
+            ),
         }
         if app.tray.is_none() {
             app.push_event(
@@ -141,8 +165,8 @@ impl App {
                 true,
             );
         }
-        if let Some(e) = startup_error {
-            app.push_event(String::new(), e, true);
+        for (text, severe) in startup_events {
+            app.push_event(String::new(), text, severe);
         }
         app
     }
@@ -186,7 +210,11 @@ impl App {
                     hop_target,
                     hops,
                     hop_loss_origin,
+                    net_if,
+                    network_up,
                 } => {
+                    self.net_if = net_if;
+                    self.network_up = network_up;
                     self.tcp = Some(tcp);
                     self.hop_target = hop_target;
                     self.hops = hops;
@@ -340,6 +368,8 @@ impl App {
 
     fn settings_menu(&mut self, ui: &mut egui::Ui) {
         let before = self.settings;
+        ui.label(RichText::new(format!("{} v{}", crate::APP_NAME, crate::VERSION)).color(GRAY));
+        ui.separator();
 
         ui.label(RichText::new("按視窗的 X 時").strong());
         ui.add_enabled_ui(self.tray.is_some(), |ui| {
@@ -457,8 +487,24 @@ impl App {
             });
         });
 
-        ui.horizontal(|ui| match &self.wifi {
-            Some(w) => {
+        ui.horizontal_wrapped(|ui| {
+            match (&self.net_if, self.network_up) {
+                (Some(n), true) => {
+                    ui.label(RichText::new(format!("網路：{}", n.summary())).color(GRAY))
+                        .on_hover_text(&n.description);
+                }
+                (Some(n), false) => {
+                    ui.label(
+                        RichText::new(format!("網路中斷：{}（{}）", n.alias, n.down_reason()))
+                            .color(RED),
+                    );
+                }
+                (None, false) => {
+                    ui.label(RichText::new("網路中斷：找不到可以上網的網路卡").color(RED));
+                }
+                (None, true) => {}
+            }
+            if let Some(w) = &self.wifi {
                 let color = if w.quality < WEAK_WIFI { YELLOW } else { GRAY };
                 ui.label(
                     RichText::new(format!("Wi-Fi：{}　訊號 {}%", w.ssid, w.quality)).color(color),
@@ -466,9 +512,6 @@ impl App {
                 if w.quality < WEAK_WIFI {
                     ui.label(RichText::new("訊號偏弱，建議改用有線網路").color(YELLOW));
                 }
-            }
-            None => {
-                ui.label(RichText::new("網路：有線（未使用 Wi-Fi）").color(GRAY));
             }
         });
 
@@ -838,7 +881,7 @@ impl eframe::App for App {
         });
     }
 
-    fn on_exit(&mut self) {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(tray) = &self.tray {
             tray.remove();
         }
@@ -878,11 +921,14 @@ fn layer_state(r: &LayerReport) -> (Health, &'static str) {
     }
 }
 
-/// 載入系統的微軟正黑體（不嵌入 exe，避免檔案變大）
-fn load_system_font(ctx: &egui::Context) -> bool {
-    let Ok(bytes) = std::fs::read(FONT_PATH) else {
-        return false;
-    };
+/// 載入系統的中文字型（不嵌入 exe，避免檔案變大）。回傳用了 FONT_CANDIDATES 的第幾個
+fn load_system_font(ctx: &egui::Context) -> Option<usize> {
+    let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
+    let fonts_dir = std::path::Path::new(&windir).join("Fonts");
+    let (index, bytes) = FONT_CANDIDATES
+        .iter()
+        .enumerate()
+        .find_map(|(i, (file, _))| std::fs::read(fonts_dir.join(file)).ok().map(|b| (i, b)))?;
     let mut fonts = egui::FontDefinitions::default();
     fonts
         .font_data
@@ -892,12 +938,12 @@ fn load_system_font(ctx: &egui::Context) -> bool {
         .entry(egui::FontFamily::Proportional)
         .or_default()
         .insert(0, "msjh".into());
-    // 等寬字型保留預設的英數字，中文再用正黑體
+    // 等寬字型保留預設的英數字，中文再用中文字型
     fonts
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
         .push("msjh".into());
     ctx.set_fonts(fonts);
-    true
+    Some(index)
 }

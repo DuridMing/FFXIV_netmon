@@ -34,6 +34,8 @@ pub enum IncidentKind {
     GameRetransmits,
     /// 遊戲連線發生重傳逾時（RTO），連續發生會導致 90002 斷線
     GameRtoTimeout,
+    /// 電腦本身的網路斷了（網路線鬆脫、Wi-Fi 斷線、網卡被停用）
+    NetworkDown,
 }
 
 impl IncidentKind {
@@ -45,6 +47,7 @@ impl IncidentKind {
             IncidentKind::LatencySpike(i) => format!("{} 延遲突增", LAYER_NAMES[i]),
             IncidentKind::GameRetransmits => "遊戲連線重傳增加".into(),
             IncidentKind::GameRtoTimeout => "遊戲連線重傳逾時".into(),
+            IncidentKind::NetworkDown => "電腦網路中斷".into(),
         }
     }
 
@@ -57,6 +60,7 @@ impl IncidentKind {
             IncidentKind::LatencySpike(i) => format!("latency_spike:{i}"),
             IncidentKind::GameRetransmits => "game_retransmits".into(),
             IncidentKind::GameRtoTimeout => "game_rto_timeout".into(),
+            IncidentKind::NetworkDown => "network_down".into(),
         }
     }
 }
@@ -67,17 +71,22 @@ pub struct EventDetector {
     high_loss: [bool; 4],
     spike: [bool; 4],
     retransmitting: bool,
+    /// 上一輪電腦的網路是不是斷的
+    network_down: bool,
     /// 距離上次事件還剩幾輪冷卻
     cooldown: u32,
 }
 
 impl EventDetector {
     /// 每輪量測後呼叫一次。`game_disconnected` 由連線表偵測，不受冷卻限制。
+    /// `network_up` 是電腦本身的網卡有沒有連線；斷線時只回報一次「電腦網路中斷」，
+    /// 斷線期間其他層的異常都是它造成的，不再另外回報。
     /// `tcp` 是遊戲連線的 TCP 統計，沒有系統管理員權限時為 None。
     pub fn check(
         &mut self,
         windows: [&Window; 4],
         game_disconnected: bool,
+        network_up: bool,
         tcp: Option<&GameTcpReport>,
     ) -> Option<IncidentKind> {
         self.cooldown = self.cooldown.saturating_sub(1);
@@ -145,7 +154,13 @@ impl EventDetector {
 
         triggered.extend(lowest_spike.map(IncidentKind::LatencySpike));
 
-        let kind = if game_disconnected {
+        let went_down = !network_up && !self.network_down;
+        self.network_down = !network_up;
+        let kind = if went_down {
+            Some(IncidentKind::NetworkDown)
+        } else if !network_up {
+            None
+        } else if game_disconnected {
             Some(IncidentKind::GameDisconnected)
         } else if self.cooldown == 0 {
             triggered.first().copied()
@@ -174,7 +189,7 @@ mod tests {
     }
 
     fn check(d: &mut EventDetector, w: &[Window; 4], disconnected: bool) -> Option<IncidentKind> {
-        d.check([&w[0], &w[1], &w[2], &w[3]], disconnected, None)
+        d.check([&w[0], &w[1], &w[2], &w[3]], disconnected, true, None)
     }
 
     const OK: Option<u32> = Some(10);
@@ -277,18 +292,18 @@ mod tcp_tests {
         let mut d = EventDetector::default();
         let w = healthy();
         let ws = [&w[0], &w[1], &w[2], &w[3]];
-        assert_eq!(d.check(ws, false, Some(&report(2, 0))), None);
+        assert_eq!(d.check(ws, false, true, Some(&report(2, 0))), None);
         assert_eq!(
-            d.check(ws, false, Some(&report(6, 0))),
+            d.check(ws, false, true, Some(&report(6, 0))),
             Some(IncidentKind::GameRetransmits)
         );
         // 還在重傳就不會重複觸發；降到 1 以下才算恢復
         d.cooldown = 0;
-        assert_eq!(d.check(ws, false, Some(&report(3, 0))), None);
-        d.check(ws, false, Some(&report(1, 0)));
+        assert_eq!(d.check(ws, false, true, Some(&report(3, 0))), None);
+        d.check(ws, false, true, Some(&report(1, 0)));
         d.cooldown = 0;
         assert_eq!(
-            d.check(ws, false, Some(&report(5, 0))),
+            d.check(ws, false, true, Some(&report(5, 0))),
             Some(IncidentKind::GameRetransmits)
         );
     }
@@ -299,8 +314,34 @@ mod tcp_tests {
         let w = healthy();
         let ws = [&w[0], &w[1], &w[2], &w[3]];
         assert_eq!(
-            d.check(ws, false, Some(&report(1, 1))),
+            d.check(ws, false, true, Some(&report(1, 1))),
             Some(IncidentKind::GameRtoTimeout)
         );
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    #[test]
+    fn network_down_reports_once_and_suppresses_others() {
+        let mut d = EventDetector::default();
+        let lossy: [Window; 4] = std::array::from_fn(|_| {
+            let mut w = Window::new(30);
+            for _ in 0..10 {
+                w.push(None);
+            }
+            w
+        });
+        let ws = [&lossy[0], &lossy[1], &lossy[2], &lossy[3]];
+        assert_eq!(
+            d.check(ws, false, false, None),
+            Some(IncidentKind::NetworkDown)
+        );
+        // 斷線期間：各層都在掉包、遊戲也斷了，都不再另外回報
+        d.cooldown = 0;
+        assert_eq!(d.check(ws, true, false, None), None);
+        assert_eq!(d.check(ws, false, false, None), None);
     }
 }

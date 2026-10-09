@@ -1,8 +1,11 @@
 //! Win32 API 包裝。所有 unsafe 呼叫集中在這裡，對外只提供安全的 API。
 
+pub mod dialog;
 pub mod elevation;
 pub mod estats;
 pub mod icmp;
+pub mod instance;
+pub mod netif;
 pub mod process;
 pub mod route;
 pub mod shell;
