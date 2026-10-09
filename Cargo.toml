@@ -2,6 +2,8 @@
 name = "ff14-netmon"
 version = "0.6.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/DuridMing/FFXIV_netmon"
 
 [dependencies]
 # 只啟用 DirectX 12，用來指定省電的顯示卡繪製介面
