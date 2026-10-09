@@ -37,7 +37,7 @@ pub struct NetIf {
     /// PPPoE 撥號、VPN 這類虛擬網卡回報「未知」，也當作有連線，只有明確回報沒連線才算斷線
     pub media_connected: bool,
     pub oper_up: bool,
-    /// 連線速度（bps），取收送較小的那個
+    /// 連線速度（bps），取收送較小的那個；虛擬網卡（VPN 等）為 0，不顯示
     pub speed_bps: u64,
 }
 
@@ -97,12 +97,17 @@ pub fn physical_interfaces() -> Vec<NetIf> {
     };
     let result = rows
         .iter()
-        .filter(|r| r.InterfaceAndOperStatusFlags._bitfield & CONNECTOR_PRESENT != 0)
+        .filter(|r| has_connector(r))
         .map(from_row)
         .filter(|n| n.kind != IfKind::Other)
         .collect();
     unsafe { FreeMibTable(table as *const _) };
     result
+}
+
+/// 實體網卡才有接頭；VPN、虛擬網卡沒有
+fn has_connector(row: &MIB_IF_ROW2) -> bool {
+    row.InterfaceAndOperStatusFlags._bitfield & CONNECTOR_PRESENT != 0
 }
 
 fn from_row(row: &MIB_IF_ROW2) -> NetIf {
@@ -119,7 +124,12 @@ fn from_row(row: &MIB_IF_ROW2) -> NetIf {
         admin_down: row.AdminStatus != NET_IF_ADMIN_STATUS_UP,
         media_connected: row.MediaConnectState != MediaConnectStateDisconnected,
         oper_up: row.OperStatus == IfOperStatusUp,
-        speed_bps: row.TransmitLinkSpeed.min(row.ReceiveLinkSpeed),
+        // VPN 這類虛擬網卡回報的速度（例如 100 Gbps）不是實際速度，沒有實體接頭的就不顯示
+        speed_bps: if has_connector(row) {
+            row.TransmitLinkSpeed.min(row.ReceiveLinkSpeed)
+        } else {
+            0
+        },
     }
 }
 
