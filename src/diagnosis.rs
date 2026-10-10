@@ -3,7 +3,9 @@
 use std::net::Ipv4Addr;
 
 use crate::events::{IncidentKind, LOSS_ON, RECENT_SECS};
+use crate::hops::RouteChange;
 use crate::monitor::{GAME, GATEWAY, INTERNET, ISP, LAYER_NAMES};
+use crate::network::{self, Throughput};
 use crate::stats::Summary;
 use crate::trace::Trace;
 use crate::wifi::WEAK_WIFI;
@@ -43,19 +45,44 @@ pub struct Context<'a> {
     pub net_if: Option<&'a NetIf>,
     /// 電腦網路斷線的原因；None 代表網路正常
     pub network_down: Option<&'a str>,
+    /// 本機網卡最近幾秒的流量
+    pub traffic: Option<Throughput>,
+    /// 路由變動的內容（RouteChanged 事件才有）
+    pub route_change: Option<&'a RouteChange>,
+    /// 電腦剛從睡眠恢復不久
+    pub resumed: bool,
 }
 
 pub fn diagnose(kind: IncidentKind, layers: &[LayerState; 4], ctx: &Context) -> String {
+    if kind == IncidentKind::GameDisconnected && ctx.resumed {
+        return "電腦剛從睡眠／休眠恢復：遊戲連線是在電腦睡眠期間中斷的，不是網路問題。".into();
+    }
     let mut text = diagnose_network(kind, layers, ctx);
-    let wifi_quality = ctx.wifi_quality;
+    // 本機大量傳輸會塞滿家裡到 ISP 這一段，延遲突增和前三層的掉包都可能是它造成的
+    let local_layers = match kind {
+        IncidentKind::LatencySpike(_) => true,
+        IncidentKind::HighLoss(i) => i != GAME,
+        _ => false,
+    };
+    if local_layers && let Some(t) = ctx.traffic.filter(|t| t.heavy()) {
+        text.push_str(&format!(
+            "這時候這台電腦本身正在大量傳輸（{}），例如 Steam／遊戲更新、Windows Update、雲端同步或直播，很可能就是它佔滿頻寬造成的；可以暫停或限制它的速度。",
+            t.text()
+        ));
+    }
     let home_issue = match kind {
         IncidentKind::LatencySpike(i) => i == GATEWAY,
         _ => layers[GATEWAY].is_bad(),
     };
-    if home_issue && let Some(q) = wifi_quality.filter(|&q| q < WEAK_WIFI) {
+    if home_issue && let Some(q) = ctx.wifi_quality.filter(|&q| q < WEAK_WIFI) {
         text.push_str(&format!(
             "目前 Wi-Fi 訊號只有 {q}%，建議改用有線網路或靠近路由器。"
         ));
+    }
+    if home_issue && ctx.net_if.is_some_and(network::slow_wired_link) {
+        text.push_str(
+            "有線網路目前只有 100 Mbps 以下：如果網卡和路由器都支援 Gigabit，可能是網路線或接頭接觸不良。",
+        );
     }
     text
 }
@@ -78,6 +105,9 @@ fn diagnose_network(kind: IncidentKind, layers: &[LayerState; 4], ctx: &Context)
     }
     if let IncidentKind::LatencySpike(i) = kind {
         return spike_diagnosis(i);
+    }
+    if kind == IncidentKind::RouteChanged {
+        return route_diagnosis(ctx.route_change);
     }
 
     match (0..layers.len()).find(|&i| layers[i].is_bad()) {
@@ -128,6 +158,22 @@ fn spike_diagnosis(layer: usize) -> String {
         ISP | INTERNET => "ISP 端延遲突增：家中網路正常，可能是 ISP 網路壅塞。".into(),
         _ => "遊戲伺服器延遲突增：本機到外部網路都正常，可能是伺服器負載高或國際路由壅塞。".into(),
     }
+}
+
+fn route_diagnosis(change: Option<&RouteChange>) -> String {
+    let Some(c) = change else {
+        return "到遊戲伺服器的路由變了，延遲也變高。".into();
+    };
+    let latency = c.latency_text();
+    let latency = if latency.is_empty() {
+        String::new()
+    } else {
+        format!("，{latency}")
+    };
+    format!(
+        "ISP 改了連到遊戲伺服器的路由（{}）{latency}。家中網路沒有變動，這是 ISP 那邊的調整；如果之後一直維持較高的延遲，可以匯出報告提供給 ISP 客服。",
+        c.hops_text()
+    )
 }
 
 /// 路徑上哪一段有問題：優先用中間節點追蹤的掉包起點，沒有的話用事件當下的 traceroute
@@ -252,6 +298,57 @@ mod tests {
         assert!(!diagnose(IncidentKind::HighLoss(0), &home, &wifi(80)).contains("Wi-Fi 訊號只有"));
         let isp = [good(), state(30.0, None), good(), good()];
         assert!(!diagnose(IncidentKind::HighLoss(1), &isp, &wifi(35)).contains("Wi-Fi 訊號只有"));
+    }
+
+    #[test]
+    fn heavy_local_traffic_explains_spike() {
+        let layers = [good(), good(), good(), good()];
+        let ctx = Context {
+            traffic: Some(Throughput {
+                rx_bps: 80_000_000,
+                tx_bps: 1_000_000,
+            }),
+            ..Default::default()
+        };
+        let text = diagnose(IncidentKind::LatencySpike(GATEWAY), &layers, &ctx);
+        assert!(text.contains("這台電腦本身正在大量傳輸（下載 80.0 Mbps"));
+        // 只有遊戲伺服器掉包時跟本機流量無關
+        let game = [good(), good(), good(), state(50.0, None)];
+        assert!(!diagnose(IncidentKind::HighLoss(GAME), &game, &ctx).contains("大量傳輸"));
+    }
+
+    #[test]
+    fn disconnect_after_resume_blames_sleep() {
+        let layers = [good(), good(), good(), good()];
+        let ctx = Context {
+            resumed: true,
+            network_down: Some("Wi-Fi 沒有連線"),
+            ..Default::default()
+        };
+        assert!(
+            diagnose(IncidentKind::GameDisconnected, &layers, &ctx).starts_with("電腦剛從睡眠")
+        );
+    }
+
+    #[test]
+    fn route_change_mentions_hops_and_latency() {
+        let layers = [good(), good(), good(), good()];
+        let change = RouteChange {
+            hops: vec![(
+                6,
+                "203.0.113.1".parse().unwrap(),
+                "198.51.100.7".parse().unwrap(),
+            )],
+            before_ms: Some(32.0),
+            after_ms: Some(58.0),
+        };
+        let ctx = Context {
+            route_change: Some(&change),
+            ..Default::default()
+        };
+        let text = diagnose(IncidentKind::RouteChanged, &layers, &ctx);
+        assert!(text.contains("第 6 跳 203.0.113.1 → 198.51.100.7"));
+        assert!(text.contains("32 ms → 58 ms"));
     }
 
     #[test]

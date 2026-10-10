@@ -39,6 +39,9 @@ pub struct NetIf {
     pub oper_up: bool,
     /// 連線速度（bps），取收送較小的那個；虛擬網卡（VPN 等）為 0，不顯示
     pub speed_bps: u64,
+    /// 開機以來收／送的位元組數，算本機流量用
+    pub in_octets: u64,
+    pub out_octets: u64,
 }
 
 impl NetIf {
@@ -130,6 +133,8 @@ fn from_row(row: &MIB_IF_ROW2) -> NetIf {
         } else {
             0
         },
+        in_octets: row.InOctets,
+        out_octets: row.OutOctets,
     }
 }
 

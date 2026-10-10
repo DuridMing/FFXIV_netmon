@@ -19,6 +19,9 @@ pub const AGGREGATE_ROUNDS: u32 = 30;
 pub const MAX_HOPS: u8 = 20;
 /// 目標本身連得上，但路徑最後幾跳連續這麼多輪沒有回應，就當作路徑變短、那幾跳已經不在路徑上
 const STALE_ROUNDS: u32 = 5;
+/// 某一跳換成新位址、連續這麼多次回應都是新位址（15 × 2 秒 = 30 秒）才算路由真的變了。
+/// 負載平衡會讓同一跳在幾個位址間輪流出現，舊位址再出現就重新計算，不會被當成路由變動
+const ROUTE_CONFIRM_ROUNDS: u32 = 15;
 
 struct HopState {
     ttl: u8,
@@ -28,6 +31,43 @@ struct HopState {
     minute: (u32, u32, u64),
     /// 連續幾輪沒有回應
     silent_rounds: u32,
+    /// 目前認定的路徑上這一跳的位址
+    stable: Option<Ipv4Addr>,
+    /// 跟 stable 不同的新位址，以及連續出現幾次
+    candidate: Option<(Ipv4Addr, u32)>,
+}
+
+/// 路由變動：哪幾跳換了位址，以及變動前後的遊戲伺服器延遲
+#[derive(Clone, Debug, Default)]
+pub struct RouteChange {
+    /// (跳數, 舊位址, 新位址)
+    pub hops: Vec<(u8, Ipv4Addr, Ipv4Addr)>,
+    pub before_ms: Option<f64>,
+    pub after_ms: Option<f64>,
+}
+
+impl RouteChange {
+    /// 延遲明顯變高：至少多 15 ms，而且多 20% 以上
+    pub fn slower(&self) -> bool {
+        matches!((self.before_ms, self.after_ms), (Some(b), Some(a)) if a - b >= 15.0 && a >= b * 1.2)
+    }
+
+    /// 例如「第 5 跳 203.0.113.1 → 198.51.100.7」，多跳時用「、」隔開
+    pub fn hops_text(&self) -> String {
+        self.hops
+            .iter()
+            .map(|(ttl, old, new)| format!("第 {ttl} 跳 {old} → {new}"))
+            .collect::<Vec<_>>()
+            .join("、")
+    }
+
+    /// 例如「遊戲伺服器延遲 32 ms → 58 ms」；缺資料時為空字串
+    pub fn latency_text(&self) -> String {
+        match (self.before_ms, self.after_ms) {
+            (Some(b), Some(a)) => format!("遊戲伺服器延遲 {b:.0} ms → {a:.0} ms"),
+            _ => String::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -54,6 +94,33 @@ pub struct HopTracker {
     target: Option<Ipv4Addr>,
     hops: Vec<HopState>,
     rounds: u32,
+    /// 這一輪確認的路由變動，由 take_route_change 取走
+    changed: Vec<(u8, Ipv4Addr, Ipv4Addr)>,
+}
+
+impl HopState {
+    /// 這一跳回應的位址；新位址連續出現夠多次就換過去，回傳 (跳數, 舊位址, 新位址)
+    fn track_route(&mut self, addr: Ipv4Addr) -> Option<(u8, Ipv4Addr, Ipv4Addr)> {
+        let Some(old) = self.stable else {
+            self.stable = Some(addr);
+            return None;
+        };
+        if addr == old {
+            self.candidate = None;
+            return None;
+        }
+        let n = match self.candidate {
+            Some((c, n)) if c == addr => n + 1,
+            _ => 1,
+        };
+        if n < ROUTE_CONFIRM_ROUNDS {
+            self.candidate = Some((addr, n));
+            return None;
+        }
+        self.stable = Some(addr);
+        self.candidate = None;
+        Some((self.ttl, old, addr))
+    }
 }
 
 impl HopTracker {
@@ -77,6 +144,7 @@ impl HopTracker {
         self.target = target;
         self.hops.clear();
         self.rounds = 0;
+        self.changed.clear();
         flushed
     }
 
@@ -105,6 +173,8 @@ impl HopTracker {
                 window: Window::new(WINDOW_SIZE),
                 minute: (0, 0, 0),
                 silent_rounds: 0,
+                stable: None,
+                candidate: None,
             });
         }
         // 已經到達目的地時，後面多出來的跳數不會再有意義
@@ -117,6 +187,9 @@ impl HopTracker {
             let rtt = result.and_then(|h| h.rtt_ms);
             if let Some(addr) = result.and_then(|h| h.addr) {
                 hop.addr = Some(addr);
+                if let Some(change) = hop.track_route(addr) {
+                    self.changed.push(change);
+                }
             }
             hop.window.push(rtt);
             hop.minute.0 += 1;
@@ -148,6 +221,26 @@ impl HopTracker {
             return None;
         }
         Some(self.aggregate())
+    }
+
+    /// 有某一跳正在換位址、還沒確認（呼叫端用來記下變動前的延遲）
+    pub fn route_pending(&self) -> bool {
+        self.hops.iter().any(|h| h.candidate.is_some())
+    }
+
+    /// 取走這一輪確認的路由變動：(跳數, 舊位址, 新位址)
+    pub fn take_route_change(&mut self) -> Vec<(u8, Ipv4Addr, Ipv4Addr)> {
+        std::mem::take(&mut self.changed)
+    }
+
+    /// 換網路（換網卡、路由器、開關 VPN）或電腦從睡眠恢復：路徑本來就會變，
+    /// 直接接受新的路徑，不算 ISP 改路由
+    pub fn reset_path(&mut self) {
+        for h in &mut self.hops {
+            h.stable = None;
+            h.candidate = None;
+        }
+        self.changed.clear();
     }
 
     /// 這一分鐘的彙總，並重新開始累計
@@ -219,6 +312,85 @@ mod tests {
                 .collect(),
             reached: false,
         }
+    }
+
+    fn addr_trace(last: [u8; 3]) -> Trace {
+        Trace {
+            hops: last
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| Hop {
+                    ttl: i as u8 + 1,
+                    addr: Some(Ipv4Addr::new(10, 0, i as u8, x)),
+                    rtt_ms: Some(5),
+                })
+                .collect(),
+            reached: false,
+        }
+    }
+
+    #[test]
+    fn route_change_confirmed_after_consecutive_rounds() {
+        let mut t = HopTracker::default();
+        t.set_target(Some(Ipv4Addr::new(10, 9, 9, 9)));
+        t.record(&addr_trace([1, 1, 1]), true);
+        for _ in 1..ROUTE_CONFIRM_ROUNDS {
+            t.record(&addr_trace([1, 2, 1]), true);
+            assert!(t.route_pending());
+            assert!(t.take_route_change().is_empty());
+        }
+        t.record(&addr_trace([1, 2, 1]), true);
+        let changes = t.take_route_change();
+        assert_eq!(
+            changes,
+            vec![(2, Ipv4Addr::new(10, 0, 1, 1), Ipv4Addr::new(10, 0, 1, 2))]
+        );
+        assert!(!t.route_pending());
+        // 已經是新路徑了，不會再報
+        t.record(&addr_trace([1, 2, 1]), true);
+        assert!(t.take_route_change().is_empty());
+    }
+
+    #[test]
+    fn load_balanced_hop_is_not_route_change() {
+        let mut t = HopTracker::default();
+        t.set_target(Some(Ipv4Addr::new(10, 9, 9, 9)));
+        for i in 0..ROUTE_CONFIRM_ROUNDS * 4 {
+            // 第 2 跳在兩個位址間輪流出現（負載平衡）
+            let x = if i % 3 == 0 { 1 } else { 2 };
+            t.record(&addr_trace([1, x, 1]), true);
+            assert!(t.take_route_change().is_empty());
+        }
+    }
+
+    #[test]
+    fn reset_path_accepts_new_route_silently() {
+        let mut t = HopTracker::default();
+        t.set_target(Some(Ipv4Addr::new(10, 9, 9, 9)));
+        t.record(&addr_trace([1, 1, 1]), true);
+        for _ in 0..ROUTE_CONFIRM_ROUNDS - 1 {
+            t.record(&addr_trace([2, 2, 2]), true);
+        }
+        t.reset_path();
+        for _ in 0..ROUTE_CONFIRM_ROUNDS * 2 {
+            t.record(&addr_trace([2, 2, 2]), true);
+            assert!(t.take_route_change().is_empty());
+        }
+    }
+
+    #[test]
+    fn route_change_latency_threshold() {
+        let change = |b, a| RouteChange {
+            hops: Vec::new(),
+            before_ms: Some(b),
+            after_ms: Some(a),
+        };
+        assert!(change(30.0, 50.0).slower());
+        // 多 10 ms 不夠
+        assert!(!change(30.0, 40.0).slower());
+        // 多 15 ms 但不到 20%
+        assert!(!change(200.0, 220.0).slower());
+        assert!(!change(50.0, 30.0).slower());
     }
 
     #[test]
