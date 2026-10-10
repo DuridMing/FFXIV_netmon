@@ -336,6 +336,13 @@ fn dx12_config(software: bool, test_failure: bool) -> eframe::WgpuConfiguration 
     if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
         setup.instance_descriptor.backends = wgpu::Backends::DX12;
         setup.power_preference = wgpu::PowerPreference::LowPower;
+        // wgpu 預設（Performance）一開始就配 128 MB 顯示記憶體 + 64 MB 主記憶體的區塊。
+        // 內顯的顯示記憶體就是系統記憶體，會全部算進程式用量；介面只畫文字和圖表，用小區塊就夠
+        let base_descriptor = Arc::clone(&setup.device_descriptor);
+        setup.device_descriptor = Arc::new(move |adapter| wgpu::DeviceDescriptor {
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            ..base_descriptor(adapter)
+        });
         if software || test_failure {
             setup.native_adapter_selector = Some(Arc::new(move |adapters, _surface| {
                 if test_failure {

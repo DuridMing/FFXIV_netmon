@@ -3,6 +3,7 @@
 pub mod dialog;
 pub mod elevation;
 pub mod estats;
+pub mod file_map;
 pub mod icmp;
 pub mod instance;
 pub mod netif;

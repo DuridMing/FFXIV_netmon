@@ -19,7 +19,7 @@ use crate::stats::{fmt_ms, fmt_rtt};
 use crate::storage;
 use crate::wifi::{self, WEAK_WIFI, WifiStatus};
 use crate::win::tray::{Tray, TrayCommand};
-use crate::win::{elevation, shell, time};
+use crate::win::{elevation, file_map, shell, time};
 
 /// 圖表保留的量測次數：300 × 2 秒 = 10 分鐘
 const HISTORY: usize = 300;
@@ -1042,10 +1042,11 @@ fn load_system_font(ctx: &egui::Context) -> Option<usize> {
     let (index, bytes) = FONT_CANDIDATES
         .iter()
         .enumerate()
-        .find_map(|(i, (file, _, _))| std::fs::read(fonts_dir.join(file)).ok().map(|b| (i, b)))?;
-    // 字型整個執行期間都要用。用 from_owned 的話 egui 內部會再複製一份（約 20 MB），
-    // 改成 'static 的資料就只有這一份
-    let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        .find_map(|(i, (file, _, _))| {
+            file_map::map_static(&fonts_dir.join(file)).map(|b| (i, b))
+        })?;
+    // 字型檔約 20 MB，用記憶體映射只會載入實際用到的字。
+    // 用 from_owned 的話 egui 內部會再複製一份，'static 的資料就不會
     let mut fonts = egui::FontDefinitions::default();
     fonts
         .font_data
