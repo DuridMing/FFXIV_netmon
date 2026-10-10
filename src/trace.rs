@@ -1,7 +1,6 @@
 //! traceroute：各 TTL 同時送出，約 1 秒就能完成。
 
 use std::net::Ipv4Addr;
-use std::thread;
 
 use crate::monitor::PROBE_TIMEOUT;
 use crate::win::icmp::{EchoResult, Icmp};
@@ -27,20 +26,11 @@ impl Trace {
 }
 
 pub fn traceroute(dest: Ipv4Addr, max_hops: u8) -> Trace {
-    let results: Vec<EchoResult> = thread::scope(|s| {
-        let handles: Vec<_> = (1..=max_hops)
-            .map(|ttl| {
-                s.spawn(move || match Icmp::new() {
-                    Ok(icmp) => icmp.echo(dest, Some(ttl), PROBE_TIMEOUT),
-                    Err(_) => EchoResult::Timeout,
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or(EchoResult::Timeout))
-            .collect()
-    });
+    let ttls: Vec<u8> = (1..=max_hops).collect();
+    let results: Vec<EchoResult> = match Icmp::new() {
+        Ok(icmp) => icmp.echo_ttls(dest, &ttls, PROBE_TIMEOUT),
+        Err(_) => ttls.iter().map(|_| EchoResult::Timeout).collect(),
+    };
 
     let mut hops = Vec::new();
     let mut reached = false;
