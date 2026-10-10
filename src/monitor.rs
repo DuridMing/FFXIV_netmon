@@ -187,6 +187,40 @@ impl Probe {
     }
 }
 
+/// 常駐的量測執行緒：每輪送一個工作進去、等結果出來。
+/// 不每輪開新執行緒：有些 DLL（例如顯示卡驅動）每條執行緒結束後會留下約 200 bytes 不釋放，
+/// 每輪開 5 條的話長時間執行每小時會多出 1.5 MB 左右（OP #497）
+struct Worker<I, O> {
+    jobs: Sender<I>,
+    results: Receiver<O>,
+}
+
+impl<I: Send + 'static, O: Send + 'static> Worker<I, O> {
+    fn new(work: impl Fn(I) -> O + Send + 'static) -> Self {
+        let (jobs, job_rx) = crossbeam_channel::bounded::<I>(1);
+        let (result_tx, results) = crossbeam_channel::bounded(1);
+        // Worker 被丟掉時 jobs 會斷開，執行緒跟著結束
+        thread::spawn(move || {
+            for job in job_rx {
+                if result_tx.send(work(job)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { jobs, results }
+    }
+
+    /// 開始一個工作；執行緒已經不在了就回傳 false
+    fn start(&self, job: I) -> bool {
+        self.jobs.send(job).is_ok()
+    }
+
+    /// 等 `start` 的工作做完
+    fn finish(&self) -> Option<O> {
+        self.results.recv().ok()
+    }
+}
+
 /// 連線還沒送出去就失敗：權限被擋（防火牆）、本機資源不足等，不代表網路有問題
 fn is_local_error(e: &std::io::Error) -> bool {
     // WSAENOBUFS、WSAEMFILE：本機 socket 資源用完
@@ -428,6 +462,9 @@ fn run(
     let mut last_wall_ms: Option<i64> = None;
     // 還剩幾輪算「剛從睡眠恢復」
     let mut resume_rounds: u32 = 0;
+    let probe_workers: [Worker<Probe, Measured>; 4] =
+        std::array::from_fn(|_| Worker::new(Probe::run));
+    let hop_worker = Worker::new(|(target, hops)| trace::traceroute(target, hops));
     loop {
         let round_start = Instant::now();
 
@@ -507,20 +544,20 @@ fn run(
             hop_records.push((old.to_string(), agg));
         }
 
-        // 各層和中間節點同時量測，一輪最多花 PROBE_TIMEOUT 的時間
+        // 各層和中間節點在各自的常駐執行緒同時量測，一輪最多花 PROBE_TIMEOUT 的時間
         let hop_probe = hop_tracker.target().map(|t| (t, hop_tracker.probe_hops()));
-        let (results, hop_trace): (Vec<Option<Measured>>, Option<Trace>) = thread::scope(|s| {
-            let hop_handle = hop_probe.map(|(t, n)| s.spawn(move || trace::traceroute(t, n)));
-            let handles: Vec<_> = layers
-                .iter()
-                .map(|l| l.probe.map(|p| s.spawn(move || p.run())))
-                .collect();
-            let results = handles
-                .into_iter()
-                .map(|h| h.map(|h| h.join().unwrap_or(Measured::Failed)))
-                .collect();
-            (results, hop_handle.and_then(|h| h.join().ok()))
-        });
+        let hop_started = hop_probe.is_some_and(|job| hop_worker.start(job));
+        let probing: Vec<Option<bool>> = layers
+            .iter()
+            .zip(&probe_workers)
+            .map(|(l, w)| l.probe.map(|p| w.start(p)))
+            .collect();
+        let results: Vec<Option<Measured>> = probing
+            .iter()
+            .zip(&probe_workers)
+            .map(|(s, w)| s.map(|ok| ok.then(|| w.finish()).flatten().unwrap_or(Measured::Failed)))
+            .collect();
+        let hop_trace: Option<Trace> = hop_started.then(|| hop_worker.finish()).flatten();
 
         // 結果要記到量測當時的目標：先寫進統計，之後才更新路由器／ISP 節點
         let ts_ms = storage::now_ms();
