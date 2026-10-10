@@ -343,18 +343,34 @@ fn dx12_config(software: bool, test_failure: bool) -> eframe::WgpuConfiguration 
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..base_descriptor(adapter)
         });
-        if software || test_failure {
-            setup.native_adapter_selector = Some(Arc::new(move |adapters, _surface| {
-                if test_failure {
-                    return Err("測試用：模擬 DirectX 12 初始化失敗".into());
-                }
-                adapters
+        // 自己從 egui-wgpu 已經列舉好的顯示卡挑。交給 wgpu 的 request_adapter 的話，
+        // 它會再列舉一次，又在每張顯示卡（包括遊戲用的獨立顯示卡）上建立一次 D3D12 裝置
+        setup.native_adapter_selector = Some(Arc::new(move |adapters, surface| {
+            if test_failure {
+                return Err("測試用：模擬 DirectX 12 初始化失敗".into());
+            }
+            if software {
+                return adapters
                     .iter()
                     .find(|a| a.get_info().device_type == wgpu::DeviceType::Cpu)
                     .cloned()
-                    .ok_or_else(|| "找不到 Windows 軟體繪圖裝置（WARP）".to_string())
-            }));
-        }
+                    .ok_or_else(|| "找不到 Windows 軟體繪圖裝置（WARP）".to_string());
+            }
+            // 跟 wgpu 的 PowerPreference::LowPower 同樣的順序：內顯優先，軟體繪圖最後
+            let rank = |t: wgpu::DeviceType| match t {
+                wgpu::DeviceType::IntegratedGpu => 0,
+                wgpu::DeviceType::DiscreteGpu => 1,
+                wgpu::DeviceType::Other => 2,
+                wgpu::DeviceType::VirtualGpu => 3,
+                wgpu::DeviceType::Cpu => 4,
+            };
+            adapters
+                .iter()
+                .filter(|a| surface.is_none_or(|s| a.is_surface_supported(s)))
+                .min_by_key(|a| rank(a.get_info().device_type))
+                .cloned()
+                .ok_or_else(|| "找不到可以繪製這個視窗的顯示卡".to_string())
+        }));
     }
     config
 }

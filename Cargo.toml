@@ -20,3 +20,7 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# 選好顯示卡後只保留實際使用的那一張，不在遊戲用的獨立顯示卡上留 D3D12 裝置（見 patches/egui-wgpu/PATCH.md）
+[patch.crates-io]
+egui-wgpu = { path = "patches/egui-wgpu" }
