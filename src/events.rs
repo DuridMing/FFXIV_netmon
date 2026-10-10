@@ -38,6 +38,8 @@ pub enum IncidentKind {
     GameRtoTimeout,
     /// 電腦本身的網路斷了（網路線鬆脫、Wi-Fi 斷線、網卡被停用）
     NetworkDown,
+    /// 到遊戲伺服器的路由變了，而且延遲明顯變高
+    RouteChanged,
 }
 
 impl IncidentKind {
@@ -50,6 +52,7 @@ impl IncidentKind {
             IncidentKind::GameRetransmits => "遊戲連線重傳增加".into(),
             IncidentKind::GameRtoTimeout => "遊戲連線重傳逾時".into(),
             IncidentKind::NetworkDown => "電腦網路中斷".into(),
+            IncidentKind::RouteChanged => "連線路由變更，延遲變高".into(),
         }
     }
 
@@ -63,6 +66,7 @@ impl IncidentKind {
             IncidentKind::GameRetransmits => "game_retransmits".into(),
             IncidentKind::GameRtoTimeout => "game_rto_timeout".into(),
             IncidentKind::NetworkDown => "network_down".into(),
+            IncidentKind::RouteChanged => "route_changed".into(),
         }
     }
 }
@@ -77,9 +81,27 @@ pub struct EventDetector {
     cooldown: u32,
     /// 遊戲斷線跟電腦網路中斷發生在同一輪：這輪先回報網路中斷，遊戲斷線留到下一輪
     pending_disconnect: bool,
+    /// 路由變動（由 route_changed 設定），下一次 check 回報
+    pending_route_change: bool,
+    /// 電腦剛從睡眠恢復：還剩幾輪不回報電腦網路中斷（網卡重新連線要幾秒）
+    resume_grace: u32,
+    /// 恢復期間發生的網路中斷，恢復期結束時還沒好才回報
+    deferred_down: bool,
 }
 
 impl EventDetector {
+    /// 電腦從睡眠恢復：接下來 `rounds` 輪不回報網路中斷和各層異常（問題持續到之後才回報）。
+    /// 遊戲斷線仍然照常記錄
+    pub fn resumed(&mut self, rounds: u32) {
+        self.resume_grace = rounds;
+        self.cooldown = self.cooldown.max(rounds);
+    }
+
+    /// 到遊戲伺服器的路由變了、延遲明顯變高：下一次 check 回報（不受冷卻限制，很少發生）
+    pub fn route_changed(&mut self) {
+        self.pending_route_change = true;
+    }
+
     /// 每輪量測後呼叫一次。`game_disconnected` 由連線表偵測，不受冷卻限制。
     /// `network` 是電腦本身的網路狀態（由 NetworkWatcher 判斷）：剛斷線時回報一次「電腦網路中斷」，
     /// 斷線期間各層的掉包都是它造成的，不再另外回報；但遊戲斷線仍然要記錄，才不會漏掉斷線次數。
@@ -93,6 +115,18 @@ impl EventDetector {
         tcp: Option<&GameTcpReport>,
     ) -> Option<IncidentKind> {
         self.cooldown = self.cooldown.saturating_sub(1);
+        let mut network = network;
+        let resuming = self.resume_grace > 0;
+        self.resume_grace = self.resume_grace.saturating_sub(1);
+        if resuming && network.went_down {
+            self.deferred_down = true;
+            network.went_down = false;
+        }
+        if !network.down {
+            self.deferred_down = false;
+        } else if !resuming && std::mem::take(&mut self.deferred_down) {
+            network.went_down = true;
+        }
 
         let mut triggered = Vec::new();
 
@@ -160,6 +194,7 @@ impl EventDetector {
         triggered.extend(lowest_spike.map(IncidentKind::LatencySpike));
 
         let game_disconnected = game_disconnected || std::mem::take(&mut self.pending_disconnect);
+        let route_changed = std::mem::take(&mut self.pending_route_change);
         let kind = if network.went_down {
             self.pending_disconnect = game_disconnected;
             Some(IncidentKind::NetworkDown)
@@ -167,6 +202,12 @@ impl EventDetector {
             Some(IncidentKind::GameDisconnected)
         } else if network.down {
             None
+        } else if route_changed {
+            // 同一輪的其他異常留到冷卻結束，還持續的話再回報
+            for &kind in &triggered {
+                self.forget(kind);
+            }
+            Some(IncidentKind::RouteChanged)
         } else if self.cooldown == 0 {
             triggered.first().copied()
         } else {
@@ -191,7 +232,8 @@ impl EventDetector {
             IncidentKind::GameRetransmits => self.retransmitting = false,
             IncidentKind::GameRtoTimeout
             | IncidentKind::GameDisconnected
-            | IncidentKind::NetworkDown => {}
+            | IncidentKind::NetworkDown
+            | IncidentKind::RouteChanged => {}
         }
     }
 }
@@ -485,5 +527,95 @@ mod network_tests {
             Some(IncidentKind::GameDisconnected)
         );
         assert_eq!(d.check(ws, false, still_down, None), None);
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    fn lossy() -> [Window; 4] {
+        std::array::from_fn(|_| {
+            let mut w = Window::new(30);
+            for _ in 0..10 {
+                w.push(None);
+            }
+            w
+        })
+    }
+
+    const UP: NetworkSignal = NetworkSignal {
+        down: false,
+        went_down: false,
+    };
+    const WENT_DOWN: NetworkSignal = NetworkSignal {
+        down: true,
+        went_down: true,
+    };
+    const STILL_DOWN: NetworkSignal = NetworkSignal {
+        down: true,
+        went_down: false,
+    };
+
+    #[test]
+    fn network_down_while_resuming_is_not_reported_if_it_recovers() {
+        let mut d = EventDetector::default();
+        let w: [Window; 4] = std::array::from_fn(|_| Window::new(30));
+        let ws = [&w[0], &w[1], &w[2], &w[3]];
+        d.resumed(5);
+        assert_eq!(d.check(ws, false, WENT_DOWN, None), None);
+        assert_eq!(d.check(ws, false, STILL_DOWN, None), None);
+        assert_eq!(d.check(ws, false, UP, None), None);
+        for _ in 0..10 {
+            assert_eq!(d.check(ws, false, UP, None), None);
+        }
+    }
+
+    #[test]
+    fn network_still_down_after_resume_grace_is_reported() {
+        let mut d = EventDetector::default();
+        let w: [Window; 4] = std::array::from_fn(|_| Window::new(30));
+        let ws = [&w[0], &w[1], &w[2], &w[3]];
+        d.resumed(3);
+        assert_eq!(d.check(ws, false, WENT_DOWN, None), None);
+        assert_eq!(d.check(ws, false, STILL_DOWN, None), None);
+        assert_eq!(d.check(ws, false, STILL_DOWN, None), None);
+        assert_eq!(
+            d.check(ws, false, STILL_DOWN, None),
+            Some(IncidentKind::NetworkDown)
+        );
+    }
+
+    #[test]
+    fn resume_suppresses_layer_loss_but_not_game_disconnect() {
+        let mut d = EventDetector::default();
+        let w = lossy();
+        let ws = [&w[0], &w[1], &w[2], &w[3]];
+        d.resumed(5);
+        assert_eq!(
+            d.check(ws, true, UP, None),
+            Some(IncidentKind::GameDisconnected)
+        );
+        assert_eq!(d.check(ws, false, UP, None), None);
+    }
+
+    #[test]
+    fn route_change_bypasses_cooldown_and_keeps_other_problems() {
+        let mut d = EventDetector::default();
+        let ok: [Window; 4] = std::array::from_fn(|_| {
+            let mut w = Window::new(30);
+            for _ in 0..10 {
+                w.push(Some(10));
+            }
+            w
+        });
+        let ws = [&ok[0], &ok[1], &ok[2], &ok[3]];
+        d.cooldown = 10;
+        d.route_changed();
+        assert_eq!(
+            d.check(ws, false, UP, None),
+            Some(IncidentKind::RouteChanged)
+        );
+        assert_eq!(d.check(ws, false, UP, None), None);
     }
 }

@@ -11,8 +11,8 @@ use crate::detector::{GameEvent, GameScanner, GameSnapshot, GameTracker};
 use crate::diagnosis::{self, LayerState};
 use crate::events::{EventDetector, IncidentKind, RECENT, RECENT_SECS};
 use crate::game_tcp::{GameTcpReport, GameTcpTracker, TcpStatus};
-use crate::hops::{self, HopReport, HopTracker};
-use crate::network::NetworkWatcher;
+use crate::hops::{self, HopReport, HopTracker, RouteChange};
+use crate::network::{NetworkWatcher, Throughput};
 use crate::stats::{Summary, Window, fmt_ms, fmt_rtt};
 use crate::storage::{self, IncidentRecord, RoundRecord, Sample, Storage};
 use crate::trace::{self, Trace};
@@ -38,6 +38,14 @@ const FLUSH_ROUNDS: usize = 30;
 const MAX_BUFFERED_ROUNDS: usize = 900;
 /// 每幾輪清一次超過保留天數的樣本（1800 × 2 秒 = 1 小時）
 const PRUNE_ROUNDS: usize = 1800;
+/// 兩輪之間隔了這麼久（正常是 2 秒）就是電腦剛從睡眠／休眠恢復
+const SLEEP_GAP_MS: i64 = 30_000;
+/// 從睡眠恢復後幾輪不判斷異常（10 × 2 秒 = 20 秒）：網卡重新連線、Wi-Fi 重新連上都要時間
+const RESUME_GRACE_ROUNDS: u32 = 10;
+/// 從睡眠恢復後幾輪內的遊戲斷線，都當作是睡眠造成的（60 × 2 秒 = 2 分鐘）。
+/// 遊戲要等一陣子才會發現連線已經斷了
+const RESUME_NOTE_ROUNDS: u32 = 60;
+
 /// 結束程式時，最多等背景執行緒多久（寫入記錄檔、或正在做事件的 traceroute）
 const STOP_WAIT: Duration = Duration::from_secs(3);
 
@@ -414,8 +422,38 @@ fn run(
     let mut last_tcp_report: Option<GameTcpReport> = None;
     let mut hop_tracker = HopTracker::default();
     let mut disconnect: Option<Disconnect> = None;
+    // 路由開始變動前的遊戲伺服器平均延遲，確認變動後拿來比較
+    let mut route_before: Option<f64> = None;
+    // 上一輪開始的時間（牆上時鐘，睡眠期間也會走）
+    let mut last_wall_ms: Option<i64> = None;
+    // 還剩幾輪算「剛從睡眠恢復」
+    let mut resume_rounds: u32 = 0;
     loop {
         let round_start = Instant::now();
+
+        let wall_ms = storage::now_ms();
+        resume_rounds = resume_rounds.saturating_sub(1);
+        if let Some(prev) = last_wall_ms
+            && wall_ms - prev >= SLEEP_GAP_MS
+        {
+            // 睡眠前的樣本跟現在無關；恢復期間網路還在重新連線，先不判斷異常
+            for layer in &mut layers {
+                layer.window.clear();
+            }
+            hop_tracker.reset_path();
+            route_before = None;
+            detector.resumed(RESUME_GRACE_ROUNDS);
+            resume_rounds = RESUME_NOTE_ROUNDS;
+            let text = format!(
+                "電腦從睡眠／休眠恢復（監測暫停了 {}），接下來 {} 秒先不判斷異常",
+                fmt_gap(wall_ms - prev),
+                RESUME_GRACE_ROUNDS as u64 * INTERVAL.as_secs()
+            );
+            if !send(event(text, false)) {
+                return;
+            }
+        }
+        last_wall_ms = Some(wall_ms);
 
         let mut game_disconnected = false;
         let mut game_conn = None;
@@ -532,6 +570,45 @@ fn run(
             layers[ISP].set_probe(network.isp.map(Probe::Icmp));
         }
 
+        // 路由變動：換網路時路徑本來就會變，不算
+        if net.path_reset {
+            hop_tracker.reset_path();
+            route_before = None;
+        }
+        let changed_hops = hop_tracker.take_route_change();
+        let mut route_change = None;
+        if !changed_hops.is_empty() {
+            let change = RouteChange {
+                hops: changed_hops,
+                before_ms: route_before.take(),
+                after_ms: layers[GAME]
+                    .window
+                    .summary_last(RECENT)
+                    .and_then(|s| s.avg_ms),
+            };
+            let latency = change.latency_text();
+            let text = if latency.is_empty() {
+                format!("連線路由變更：{}", change.hops_text())
+            } else {
+                format!("連線路由變更：{}，{latency}", change.hops_text())
+            };
+            if !send(event(text, false)) {
+                return;
+            }
+            if change.slower() {
+                detector.route_changed();
+            }
+            route_change = Some(change);
+        } else if !hop_tracker.route_pending() {
+            route_before = None;
+        } else if route_before.is_none() {
+            // 剛開始換位址：最新一筆可能已經是新路徑，不算進變動前的平均
+            route_before = layers[GAME]
+                .window
+                .summary_before_last(WINDOW_SIZE)
+                .and_then(|s| s.avg_ms);
+        }
+
         let wifi = wifi_watcher.update(net.net_if.as_ref());
         if let Some((text, severe)) = wifi_event(&last_wifi, &wifi)
             && !send(event(text, severe))
@@ -558,6 +635,9 @@ fn run(
                 trace: hop_trace
                     .as_ref()
                     .filter(|_| hop_tracker.target() == last_game_target.map(|t| *t.ip())),
+                traffic: net.traffic,
+                route_change: route_change.as_ref(),
+                resumed: resume_rounds > 0,
             };
             // 遊戲斷線（或同一輪的網路中斷）：遊戲層和中間節點用斷線前的狀態
             if let Some(d) = disconnect.as_ref().filter(|_| {
@@ -691,6 +771,22 @@ struct IncidentExtra<'a> {
     hop_loss_origin: Option<(u8, Option<Ipv4Addr>)>,
     /// 這一輪中間節點追蹤到遊戲伺服器的 traceroute；有的話事件直接用，不再另外追蹤一次
     trace: Option<&'a Trace>,
+    /// 本機網卡最近幾秒的流量
+    traffic: Option<Throughput>,
+    route_change: Option<&'a RouteChange>,
+    /// 電腦剛從睡眠恢復不久
+    resumed: bool,
+}
+
+/// 睡眠時間：「45 秒」、「12 分鐘」、「3 小時 5 分鐘」
+fn fmt_gap(ms: i64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        ..120 => format!("{secs} 秒"),
+        120..3600 => format!("{} 分鐘", secs / 60),
+        _ if secs % 3600 < 60 => format!("{} 小時", secs / 3600),
+        _ => format!("{} 小時 {} 分鐘", secs / 3600, secs % 3600 / 60),
+    }
 }
 
 fn build_incident(
@@ -708,6 +804,7 @@ fn build_incident(
             | IncidentKind::LatencySpike(GAME)
             | IncidentKind::GameRetransmits
             | IncidentKind::GameRtoTimeout
+            | IncidentKind::RouteChanged
     );
     // 斷線時中間節點追蹤已經停了，才需要另外追蹤一次
     let fresh_trace;
@@ -733,6 +830,12 @@ fn build_incident(
     }
     if let Some(line) = wifi_detail(extra.wifi, extra.net_if) {
         details.push(line);
+    }
+    if let Some(t) = extra.traffic {
+        details.push(format!("本機流量（近 6 秒最高）：{}", t.text()));
+    }
+    if let Some(c) = extra.route_change {
+        details.push(format!("路由變更：{}", c.hops_text()));
     }
     if let Some(t) = &extra.tcp {
         details.push(format!(
@@ -761,6 +864,9 @@ fn build_incident(
         net_if: extra.net_if,
         network_down: extra.network_down,
         retrans_recent: extra.tcp.map(|t| t.retrans_recent),
+        traffic: extra.traffic,
+        route_change: extra.route_change,
+        resumed: extra.resumed,
     };
     Incident {
         time: time::now_hms(),
@@ -843,7 +949,17 @@ mod tests {
             media_connected: kind != IfKind::Wifi,
             oper_up: true,
             speed_bps: 0,
+            in_octets: 0,
+            out_octets: 0,
         }
+    }
+
+    #[test]
+    fn gap_text() {
+        assert_eq!(fmt_gap(45_000), "45 秒");
+        assert_eq!(fmt_gap(12 * 60_000 + 5_000), "12 分鐘");
+        assert_eq!(fmt_gap(2 * 3_600_000), "2 小時");
+        assert_eq!(fmt_gap(3 * 3_600_000 + 5 * 60_000), "3 小時 5 分鐘");
     }
 
     #[test]
