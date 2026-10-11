@@ -86,26 +86,41 @@ impl Throughput {
 struct TrafficMeter {
     /// 上一次的讀數：(網卡, 收, 送, 時間)
     last: Option<(u32, u64, u64, Instant)>,
+    /// 上一次讀數時計數器倒退了：網卡斷線、重新連線時計數器可能暫時變小再跳回累計值，
+    /// 跳回來的那一輪差值不是真的流量，所以倒退後的下一輪也不算
+    after_reset: bool,
     recent: [Option<Throughput>; TRAFFIC_ROUNDS],
     next: usize,
 }
 
 impl TrafficMeter {
     fn update(&mut self, net_if: Option<&NetIf>, now: Instant) -> Option<Throughput> {
+        // 沒有連線的網卡計數器不可靠，不當作比較基準
+        let net_if = net_if.filter(|n| n.connected());
         let current = net_if.map(|n| (n.index, n.in_octets, n.out_octets, now));
+        let mut reset = false;
         let rate = match (self.last, current) {
-            // 換網卡或計數器歸零（網卡重新啟用）時這一輪沒有流量資料
-            (Some((i0, rx0, tx0, t0)), Some((i1, rx1, tx1, t1)))
-                if i0 == i1 && rx1 >= rx0 && tx1 >= tx0 =>
-            {
-                let secs = t1.duration_since(t0).as_secs_f64();
-                (secs > 0.0).then(|| Throughput {
-                    rx_bps: ((rx1 - rx0) as f64 * 8.0 / secs) as u64,
-                    tx_bps: ((tx1 - tx0) as f64 * 8.0 / secs) as u64,
-                })
+            // 換網卡時這一輪沒有流量資料
+            (Some((i0, rx0, tx0, t0)), Some((i1, rx1, tx1, t1))) if i0 == i1 => {
+                if rx1 < rx0 || tx1 < tx0 {
+                    // 計數器歸零（網卡重新啟用）或暫時變小
+                    reset = true;
+                    None
+                } else if self.after_reset {
+                    None
+                } else {
+                    let secs = t1.duration_since(t0).as_secs_f64();
+                    (secs > 0.0)
+                        .then(|| Throughput {
+                            rx_bps: ((rx1 - rx0) as f64 * 8.0 / secs) as u64,
+                            tx_bps: ((tx1 - tx0) as f64 * 8.0 / secs) as u64,
+                        })
+                        .filter(|r| net_if.is_some_and(|n| plausible(r, n.speed_bps)))
+                }
             }
             _ => None,
         };
+        self.after_reset = reset;
         self.last = current;
         self.recent[self.next] = rate;
         self.next = (self.next + 1) % TRAFFIC_ROUNDS;
@@ -118,6 +133,13 @@ impl TrafficMeter {
                 tx_bps: a.tx_bps.max(b.tx_bps),
             })
     }
+}
+
+/// 流量不可能超過網卡連線速度太多（連線速度是收送兩個方向中較低的那個，所以留兩倍的空間）；
+/// 超過就是計數器不連續，這一輪不算。VPN 等虛擬網卡沒有連線速度，不檢查
+fn plausible(rate: &Throughput, speed_bps: u64) -> bool {
+    let limit = speed_bps.saturating_mul(2);
+    speed_bps == 0 || (rate.rx_bps <= limit && rate.tx_bps <= limit)
 }
 
 /// 有線網卡連線速度下降（多半是網路線或接頭接觸不良）
@@ -415,6 +437,63 @@ mod tests {
         m.update(Some(&card(1, 0, 5_000, 0)), t0);
         assert_eq!(
             m.update(Some(&card(1, 0, 10, 0)), t0 + Duration::from_secs(2)),
+            None
+        );
+    }
+
+    #[test]
+    fn traffic_ignores_counter_jumping_back() {
+        // 重新連線時計數器暫時變小，下一輪又跳回累計值：跳回來的差值不是流量
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut m = TrafficMeter::default();
+        m.update(Some(&card(1, 0, 1_000_000_000, 0)), at(0));
+        assert_eq!(m.update(Some(&card(1, 0, 0, 0)), at(2)), None);
+        assert_eq!(m.update(Some(&card(1, 0, 1_000_000_000, 0)), at(4)), None);
+        // 之後恢復正常計算
+        let r = m
+            .update(Some(&card(1, 0, 1_010_000_000, 0)), at(6))
+            .unwrap();
+        assert_eq!(r.rx_bps, 40_000_000);
+    }
+
+    #[test]
+    fn traffic_rejects_rate_above_link_speed() {
+        let t0 = Instant::now();
+        let mut m = TrafficMeter::default();
+        let gbps = 1_000_000_000;
+        m.update(Some(&card(1, gbps, 0, 0)), t0);
+        // 2 秒收 1 GB = 4 Gbps，網卡只有 1 Gbps
+        assert_eq!(
+            m.update(
+                Some(&card(1, gbps, 1_000_000_000, 0)),
+                t0 + Duration::from_secs(2)
+            ),
+            None
+        );
+        // 接近連線速度的真實流量照算
+        let r = m
+            .update(
+                Some(&card(1, gbps, 1_200_000_000, 0)),
+                t0 + Duration::from_secs(4),
+            )
+            .unwrap();
+        assert_eq!(r.rx_bps, 800_000_000);
+    }
+
+    #[test]
+    fn traffic_skips_disconnected_adapter() {
+        let t0 = Instant::now();
+        let mut m = TrafficMeter::default();
+        let mut down = card(1, 0, 0, 0);
+        down.media_connected = false;
+        m.update(Some(&down), t0);
+        // 斷線時的讀數不當基準：重新連上的第一輪只記下讀數
+        assert_eq!(
+            m.update(
+                Some(&card(1, 0, 1_000_000_000, 0)),
+                t0 + Duration::from_secs(2)
+            ),
             None
         );
     }
