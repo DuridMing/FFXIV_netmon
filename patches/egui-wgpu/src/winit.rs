@@ -288,6 +288,10 @@ impl Painter {
                 wgpu::CompositeAlphaMode::Auto
             }
         };
+        // ff14-netmon patch: 一開始的大小就超過顯示卡上限時（見 resize_and_generate_depth_texture_view_and_msaa_view），
+        // 先限制在上限內，surface 才設定得起來
+        let max_side = self.max_texture_side_u32();
+        let (width, height) = (width.min(max_side), height.min(max_side));
         self.surfaces.insert(
             viewport_id,
             SurfaceState {
@@ -322,6 +326,13 @@ impl Painter {
             .map(|rs| rs.device.limits().max_texture_dimension_2d as usize)
     }
 
+    // ff14-netmon patch
+    fn max_texture_side_u32(&self) -> u32 {
+        self.render_state
+            .as_ref()
+            .map_or(u32::MAX, |rs| rs.device.limits().max_texture_dimension_2d)
+    }
+
     fn resize_and_generate_depth_texture_view_and_msaa_view(
         &mut self,
         viewport_id: ViewportId,
@@ -332,6 +343,17 @@ impl Painter {
 
         let width = width_in_pixels.get();
         let height = height_in_pixels.get();
+
+        // ff14-netmon patch: 視窗被其他程式設成超過顯示卡上限的大小（或負的高度被當成很大的無號數）時，
+        // wgpu 的 Surface::configure 驗證失敗會讓整個程式結束。這時維持原本的大小，
+        // 畫面會被縮放，視窗回到正常大小後就恢復
+        let max_side = self.max_texture_side_u32();
+        if width > max_side || height > max_side {
+            log::warn!(
+                "Ignoring window size {width}x{height}: exceeds max texture dimension {max_side}"
+            );
+            return;
+        }
 
         let render_state = self.render_state.as_ref().unwrap();
         let surface_state = self.surfaces.get_mut(&viewport_id).unwrap();
