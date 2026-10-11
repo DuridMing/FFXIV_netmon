@@ -2,6 +2,7 @@
 
 use std::ffi::c_void;
 use std::net::Ipv4Addr;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
@@ -16,6 +17,45 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 const PAYLOAD: [u8; 32] = [0x61; 32];
 /// 非同步完成時驅動程式要等這麼久才會放棄；逾時後再多等一點讓它回報
 const ASYNC_GRACE: Duration = Duration::from_millis(500);
+/// 逾時還沒完成的 echo 最多留著幾個等驅動程式完成；超過就放棄最舊的（緩衝區只能留著不釋放）
+const MAX_LATE: usize = 64;
+
+/// 逾時時驅動程式還沒完成的 echo：(event handle, 回覆緩衝區)。
+/// 驅動程式之後還可能寫入緩衝區，要等 event 觸發（完成或 handle 關閉時取消）才能釋放。
+/// Icmp 每次 traceroute 都會重建，所以放在模組層級，下一次 echo_ttls 時回收
+static LATE: Mutex<Vec<(usize, Vec<u64>)>> = Mutex::new(Vec::new());
+
+/// 回收驅動程式已經完成的逾時 echo
+fn reap_late() {
+    let Ok(mut late) = LATE.lock() else { return };
+    late.retain(|&(event, _)| {
+        let event = HANDLE(event as *mut c_void);
+        if unsafe { WaitForSingleObject(event, 0) } != WAIT_OBJECT_0 {
+            return true;
+        }
+        unsafe {
+            let _ = CloseHandle(event);
+        }
+        false
+    });
+}
+
+/// 逾時還沒完成的 echo 交給 LATE 保管
+fn keep_late(event: HANDLE, buf: Vec<u64>) {
+    let Ok(mut late) = LATE.lock() else {
+        std::mem::forget(buf);
+        return;
+    };
+    if late.len() >= MAX_LATE {
+        // 很久都沒完成：不再等，緩衝區只能留著（每個約 200 bytes）
+        let (old_event, old_buf) = late.remove(0);
+        std::mem::forget(old_buf);
+        unsafe {
+            let _ = CloseHandle(HANDLE(old_event as *mut c_void));
+        }
+    }
+    late.push((event.0 as usize, buf));
+}
 
 pub enum EchoResult {
     Reply {
@@ -54,6 +94,8 @@ struct Pending {
     buf: Vec<u64>,
     options: IP_OPTION_INFORMATION,
     sent: bool,
+    /// 送出時就同步完成了，不用等 event
+    done: bool,
 }
 
 pub struct Icmp(HANDLE);
@@ -99,8 +141,10 @@ impl Icmp {
                     ..Default::default()
                 },
                 sent: false,
+                done: false,
             })
             .collect();
+        reap_late();
 
         for p in &mut pending {
             if p.event.is_invalid() {
@@ -121,8 +165,10 @@ impl Icmp {
                     timeout.as_millis() as u32,
                 )
             };
-            // 有指定 event 時正常會回 0 + ERROR_IO_PENDING；其他錯誤代表沒送出去
-            p.sent = ret != 0 || unsafe { GetLastError() } == ERROR_IO_PENDING;
+            // 有指定 event 時正常會回 0 + ERROR_IO_PENDING；回非 0 是同步完成（回覆已經在緩衝區），
+            // 其他錯誤代表沒送出去
+            p.done = ret != 0;
+            p.sent = p.done || unsafe { GetLastError() } == ERROR_IO_PENDING;
         }
 
         let deadline = Instant::now() + timeout + ASYNC_GRACE;
@@ -133,10 +179,13 @@ impl Icmp {
                     return EchoResult::Timeout;
                 }
                 let left = deadline.saturating_duration_since(Instant::now());
-                if unsafe { WaitForSingleObject(p.event, left.as_millis() as u32) } != WAIT_OBJECT_0
+                if !p.done
+                    && unsafe { WaitForSingleObject(p.event, left.as_millis() as u32) }
+                        != WAIT_OBJECT_0
                 {
-                    // 驅動程式還可能寫入緩衝區，不能釋放，只好留著
-                    std::mem::forget(std::mem::take(&mut p.buf));
+                    // 驅動程式還可能寫入緩衝區，現在不能釋放；event 也要留著，之後才知道它完成了沒
+                    keep_late(p.event, std::mem::take(&mut p.buf));
+                    p.event = HANDLE::default();
                     return EchoResult::Timeout;
                 }
                 let count = unsafe {
