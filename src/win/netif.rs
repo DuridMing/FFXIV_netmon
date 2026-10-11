@@ -66,12 +66,23 @@ impl NetIf {
 
     /// 例如「乙太網路，1 Gbps」
     pub fn summary(&self) -> String {
-        let speed = match self.speed_bps {
-            0 => String::new(),
-            s if s >= 1_000_000_000 => format!("，{} Gbps", s / 1_000_000_000),
-            s => format!("，{} Mbps", s / 1_000_000),
-        };
-        format!("{}{speed}", self.alias)
+        match self.speed_bps {
+            0 => self.alias.clone(),
+            s => format!("{}，{}", self.alias, fmt_speed(s)),
+        }
+    }
+}
+
+/// 連線速度，例如「1 Gbps」、「2.5 Gbps」、「100 Mbps」
+pub fn fmt_speed(bps: u64) -> String {
+    if bps >= 1_000_000_000 {
+        let tenths = bps / 100_000_000;
+        match tenths % 10 {
+            0 => format!("{} Gbps", tenths / 10),
+            d => format!("{}.{d} Gbps", tenths / 10),
+        }
+    } else {
+        format!("{} Mbps", bps / 1_000_000)
     }
 }
 
