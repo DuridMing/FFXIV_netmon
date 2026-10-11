@@ -38,8 +38,8 @@ const FLUSH_ROUNDS: usize = 30;
 const MAX_BUFFERED_ROUNDS: usize = 900;
 /// 每幾輪清一次超過保留天數的樣本（1800 × 2 秒 = 1 小時）
 const PRUNE_ROUNDS: usize = 1800;
-/// 兩輪之間隔了這麼久（正常是 2 秒）就是電腦剛從睡眠／休眠恢復
-const SLEEP_GAP_MS: i64 = 30_000;
+/// 兩次檢查之間電腦睡了這麼久，就當作剛從睡眠／休眠恢復
+const SLEEP_GAP_MS: u64 = 30_000;
 /// 從睡眠恢復後幾輪不判斷異常（10 × 2 秒 = 20 秒）：網卡重新連線、Wi-Fi 重新連上都要時間
 const RESUME_GRACE_ROUNDS: u32 = 10;
 /// 從睡眠恢復後幾輪內的遊戲斷線，都當作是睡眠造成的（60 × 2 秒 = 2 分鐘）。
@@ -184,6 +184,40 @@ impl Probe {
             Probe::Icmp(ip) => ip.to_string(),
             Probe::Tcp(addr) => addr.to_string(),
         }
+    }
+}
+
+/// 常駐的量測執行緒：每輪送一個工作進去、等結果出來。
+/// 不每輪開新執行緒：有些 DLL（例如顯示卡驅動）每條執行緒結束後會留下約 200 bytes 不釋放，
+/// 每輪開 5 條的話長時間執行每小時會多出 1.5 MB 左右（OP #497）
+struct Worker<I, O> {
+    jobs: Sender<I>,
+    results: Receiver<O>,
+}
+
+impl<I: Send + 'static, O: Send + 'static> Worker<I, O> {
+    fn new(work: impl Fn(I) -> O + Send + 'static) -> Self {
+        let (jobs, job_rx) = crossbeam_channel::bounded::<I>(1);
+        let (result_tx, results) = crossbeam_channel::bounded(1);
+        // Worker 被丟掉時 jobs 會斷開，執行緒跟著結束
+        thread::spawn(move || {
+            for job in job_rx {
+                if result_tx.send(work(job)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { jobs, results }
+    }
+
+    /// 開始一個工作；執行緒已經不在了就回傳 false
+    fn start(&self, job: I) -> bool {
+        self.jobs.send(job).is_ok()
+    }
+
+    /// 等 `start` 的工作做完
+    fn finish(&self) -> Option<O> {
+        self.results.recv().ok()
     }
 }
 
@@ -424,36 +458,30 @@ fn run(
     let mut disconnect: Option<Disconnect> = None;
     // 路由開始變動前的遊戲伺服器平均延遲，確認變動後拿來比較
     let mut route_before: Option<f64> = None;
-    // 上一輪開始的時間（牆上時鐘，睡眠期間也會走）
-    let mut last_wall_ms: Option<i64> = None;
+    // 延遲變高、等著回報成異常事件的路由變動（同一輪有斷線時會晚幾輪才回報）
+    let mut slower_route: Option<RouteChange> = None;
+    let mut sleep_clock = SleepClock::default();
     // 還剩幾輪算「剛從睡眠恢復」
     let mut resume_rounds: u32 = 0;
+    let probe_workers: [Worker<Probe, Measured>; 4] =
+        std::array::from_fn(|_| Worker::new(Probe::run));
+    let hop_worker = Worker::new(|(target, hops)| trace::traceroute(target, hops));
     loop {
         let round_start = Instant::now();
 
-        let wall_ms = storage::now_ms();
         resume_rounds = resume_rounds.saturating_sub(1);
-        if let Some(prev) = last_wall_ms
-            && wall_ms - prev >= SLEEP_GAP_MS
-        {
-            // 睡眠前的樣本跟現在無關；恢復期間網路還在重新連線，先不判斷異常
-            for layer in &mut layers {
-                layer.window.clear();
-            }
-            hop_tracker.reset_path();
+        if let Some(slept) = sleep_clock.check() {
             route_before = None;
-            detector.resumed(RESUME_GRACE_ROUNDS);
             resume_rounds = RESUME_NOTE_ROUNDS;
-            let text = format!(
-                "電腦從睡眠／休眠恢復（監測暫停了 {}），接下來 {} 秒先不判斷異常",
-                fmt_gap(wall_ms - prev),
-                RESUME_GRACE_ROUNDS as u64 * INTERVAL.as_secs()
-            );
-            if !send(event(text, false)) {
+            if !send(on_resume(
+                slept,
+                &mut layers,
+                &mut hop_tracker,
+                &mut detector,
+            )) {
                 return;
             }
         }
-        last_wall_ms = Some(wall_ms);
 
         let mut game_disconnected = false;
         let mut game_conn = None;
@@ -507,20 +535,35 @@ fn run(
             hop_records.push((old.to_string(), agg));
         }
 
-        // 各層和中間節點同時量測，一輪最多花 PROBE_TIMEOUT 的時間
+        // 各層和中間節點在各自的常駐執行緒同時量測，一輪最多花 PROBE_TIMEOUT 的時間
         let hop_probe = hop_tracker.target().map(|t| (t, hop_tracker.probe_hops()));
-        let (results, hop_trace): (Vec<Option<Measured>>, Option<Trace>) = thread::scope(|s| {
-            let hop_handle = hop_probe.map(|(t, n)| s.spawn(move || trace::traceroute(t, n)));
-            let handles: Vec<_> = layers
-                .iter()
-                .map(|l| l.probe.map(|p| s.spawn(move || p.run())))
-                .collect();
-            let results = handles
-                .into_iter()
-                .map(|h| h.map(|h| h.join().unwrap_or(Measured::Failed)))
-                .collect();
-            (results, hop_handle.and_then(|h| h.join().ok()))
-        });
+        let hop_started = hop_probe.is_some_and(|job| hop_worker.start(job));
+        let probing: Vec<Option<bool>> = layers
+            .iter()
+            .zip(&probe_workers)
+            .map(|(l, w)| l.probe.map(|p| w.start(p)))
+            .collect();
+        let mut results: Vec<Option<Measured>> = probing
+            .iter()
+            .zip(&probe_workers)
+            .map(|(s, w)| s.map(|ok| ok.then(|| w.finish()).flatten().unwrap_or(Measured::Failed)))
+            .collect();
+        let mut hop_trace: Option<Trace> = hop_started.then(|| hop_worker.finish()).flatten();
+        // 量測途中睡著了：這輪的結果是跨越睡眠量到的，不算
+        if let Some(slept) = sleep_clock.check() {
+            results.fill(None);
+            hop_trace = None;
+            route_before = None;
+            resume_rounds = RESUME_NOTE_ROUNDS;
+            if !send(on_resume(
+                slept,
+                &mut layers,
+                &mut hop_tracker,
+                &mut detector,
+            )) {
+                return;
+            }
+        }
 
         // 結果要記到量測當時的目標：先寫進統計，之後才更新路由器／ISP 節點
         let ts_ms = storage::now_ms();
@@ -576,11 +619,11 @@ fn run(
             route_before = None;
         }
         let changed_hops = hop_tracker.take_route_change();
-        let mut route_change = None;
         if !changed_hops.is_empty() {
             let change = RouteChange {
                 hops: changed_hops,
-                before_ms: route_before.take(),
+                // 變動還沒全部確認完時，之後確認的節點也要跟同一個變動前的延遲比較
+                before_ms: route_before,
                 after_ms: layers[GAME]
                     .window
                     .summary_last(RECENT)
@@ -597,9 +640,10 @@ fn run(
             }
             if change.slower() {
                 detector.route_changed();
+                slower_route = Some(change);
             }
-            route_change = Some(change);
-        } else if !hop_tracker.route_pending() {
+        }
+        if !hop_tracker.route_pending() {
             route_before = None;
         } else if route_before.is_none() {
             // 剛開始換位址：最新一筆可能已經是新路徑，不算進變動前的平均
@@ -622,6 +666,7 @@ fn run(
         let hop_loss_origin = hop_tracker.loss_origin();
         let kind = detector.check(windows, game_disconnected, net.signal, tcp_report.as_ref());
         let mut incident_record = None;
+        let route_change = slower_route.take_if(|_| kind == Some(IncidentKind::RouteChanged));
         if let Some(kind) = kind {
             let mut states = layers.each_ref().map(Layer::state);
             let mut targets = targets.clone();
@@ -778,8 +823,49 @@ struct IncidentExtra<'a> {
     resumed: bool,
 }
 
+/// 偵測電腦睡眠：比較包含和不含睡眠的開機時間，系統校時不會影響
+#[derive(Default)]
+struct SleepClock {
+    last: Option<(u64, u64)>,
+}
+
+impl SleepClock {
+    /// 上次檢查到現在睡了多久（毫秒）；沒睡或不到 SLEEP_GAP_MS 回傳 None
+    fn check(&mut self) -> Option<u64> {
+        self.check_at(time::uptime_ms())
+    }
+
+    fn check_at(&mut self, now: (u64, u64)) -> Option<u64> {
+        let (total, unbiased) = self.last.replace(now)?;
+        let slept = (now.0 - total).saturating_sub(now.1 - unbiased);
+        (slept >= SLEEP_GAP_MS).then_some(slept)
+    }
+}
+
+/// 從睡眠恢復：睡眠前的樣本跟現在無關；恢復期間網路還在重新連線，先不判斷異常
+fn on_resume(
+    slept_ms: u64,
+    layers: &mut [Layer; 4],
+    hop_tracker: &mut HopTracker,
+    detector: &mut EventDetector,
+) -> MonitorMsg {
+    for layer in layers {
+        layer.window.clear();
+    }
+    hop_tracker.reset_path();
+    detector.resumed(RESUME_GRACE_ROUNDS);
+    event(
+        format!(
+            "電腦從睡眠／休眠恢復（監測暫停了 {}），接下來 {} 秒先不判斷異常",
+            fmt_gap(slept_ms),
+            RESUME_GRACE_ROUNDS as u64 * INTERVAL.as_secs()
+        ),
+        false,
+    )
+}
+
 /// 睡眠時間：「45 秒」、「12 分鐘」、「3 小時 5 分鐘」
-fn fmt_gap(ms: i64) -> String {
+fn fmt_gap(ms: u64) -> String {
     let secs = ms / 1000;
     match secs {
         ..120 => format!("{secs} 秒"),
@@ -952,6 +1038,20 @@ mod tests {
             in_octets: 0,
             out_octets: 0,
         }
+    }
+
+    #[test]
+    fn sleep_clock_counts_only_suspended_time() {
+        let mut c = SleepClock::default();
+        assert_eq!(c.check_at((1_000, 1_000)), None);
+        // 一般的一輪：兩個時間一起走
+        assert_eq!(c.check_at((3_000, 3_000)), None);
+        // 量測卡了 40 秒但沒有睡眠：不算
+        assert_eq!(c.check_at((43_000, 43_000)), None);
+        // 睡了 10 分鐘
+        assert_eq!(c.check_at((645_000, 45_000)), Some(600_000));
+        // 睡不到 SLEEP_GAP_MS 不算
+        assert_eq!(c.check_at((667_000, 47_000)), None);
     }
 
     #[test]

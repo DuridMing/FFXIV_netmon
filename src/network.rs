@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use crate::monitor::INTERNET_TARGET;
 use crate::trace;
-use crate::win::netif::{self, IfKind, NetIf};
-use crate::win::route;
+use crate::win::netif::{self, IfKind, NetIf, fmt_speed};
+use crate::win::{route, time};
 
 /// 找 ISP 節點只需要看前幾跳
 const ISP_TRACE_HOPS: u8 = 8;
@@ -24,6 +24,11 @@ const HEAVY_TX_BPS: u64 = 5_000_000;
 /// 有線網卡曾經有 1 Gbps 以上、後來掉到 100 Mbps 以下，就是降速了
 const FAST_LINK_BPS: u64 = 1_000_000_000;
 const SLOW_LINK_BPS: u64 = 100_000_000;
+/// 降速要連續這麼多輪（3 × 2 秒 = 6 秒）才回報：睡眠恢復或重新接上時，網卡可能短暫協商在較低速度
+const SLOW_LINK_ROUNDS: u32 = 3;
+/// 有線網卡這麼久沒連上（包含睡眠時間，5 分鐘）就重新記錄最高速度：
+/// 筆電可能已經帶到別的地方，接上只支援 100 Mbps 的交換器不是網路線的問題
+const LINK_FORGET_MS: u64 = 5 * 60_000;
 
 const NO_ROUTE: &str = "網路卡有連線，但沒有取得對外的路由（可能是沒有拿到閘道，或 VPN 正在切換）";
 const NO_ADAPTER: &str = "沒有任何網路卡連上網路（網路線沒有接上、Wi-Fi 沒有連線，或網路卡被停用）";
@@ -81,26 +86,41 @@ impl Throughput {
 struct TrafficMeter {
     /// 上一次的讀數：(網卡, 收, 送, 時間)
     last: Option<(u32, u64, u64, Instant)>,
+    /// 上一次讀數時計數器倒退了：網卡斷線、重新連線時計數器可能暫時變小再跳回累計值，
+    /// 跳回來的那一輪差值不是真的流量，所以倒退後的下一輪也不算
+    after_reset: bool,
     recent: [Option<Throughput>; TRAFFIC_ROUNDS],
     next: usize,
 }
 
 impl TrafficMeter {
     fn update(&mut self, net_if: Option<&NetIf>, now: Instant) -> Option<Throughput> {
+        // 沒有連線的網卡計數器不可靠，不當作比較基準
+        let net_if = net_if.filter(|n| n.connected());
         let current = net_if.map(|n| (n.index, n.in_octets, n.out_octets, now));
+        let mut reset = false;
         let rate = match (self.last, current) {
-            // 換網卡或計數器歸零（網卡重新啟用）時這一輪沒有流量資料
-            (Some((i0, rx0, tx0, t0)), Some((i1, rx1, tx1, t1)))
-                if i0 == i1 && rx1 >= rx0 && tx1 >= tx0 =>
-            {
-                let secs = t1.duration_since(t0).as_secs_f64();
-                (secs > 0.0).then(|| Throughput {
-                    rx_bps: ((rx1 - rx0) as f64 * 8.0 / secs) as u64,
-                    tx_bps: ((tx1 - tx0) as f64 * 8.0 / secs) as u64,
-                })
+            // 換網卡時這一輪沒有流量資料
+            (Some((i0, rx0, tx0, t0)), Some((i1, rx1, tx1, t1))) if i0 == i1 => {
+                if rx1 < rx0 || tx1 < tx0 {
+                    // 計數器歸零（網卡重新啟用）或暫時變小
+                    reset = true;
+                    None
+                } else if self.after_reset {
+                    None
+                } else {
+                    let secs = t1.duration_since(t0).as_secs_f64();
+                    (secs > 0.0)
+                        .then(|| Throughput {
+                            rx_bps: ((rx1 - rx0) as f64 * 8.0 / secs) as u64,
+                            tx_bps: ((tx1 - tx0) as f64 * 8.0 / secs) as u64,
+                        })
+                        .filter(|r| net_if.is_some_and(|n| plausible(r, n.speed_bps)))
+                }
             }
             _ => None,
         };
+        self.after_reset = reset;
         self.last = current;
         self.recent[self.next] = rate;
         self.next = (self.next + 1) % TRAFFIC_ROUNDS;
@@ -115,28 +135,54 @@ impl TrafficMeter {
     }
 }
 
+/// 流量不可能超過網卡連線速度太多（連線速度是收送兩個方向中較低的那個，所以留兩倍的空間）；
+/// 超過就是計數器不連續，這一輪不算。VPN 等虛擬網卡沒有連線速度，不檢查
+fn plausible(rate: &Throughput, speed_bps: u64) -> bool {
+    let limit = speed_bps.saturating_mul(2);
+    speed_bps == 0 || (rate.rx_bps <= limit && rate.tx_bps <= limit)
+}
+
 /// 有線網卡連線速度下降（多半是網路線或接頭接觸不良）
 #[derive(Default)]
 struct LinkSpeedWatch {
     /// (網卡, 看過的最高速度)
     best: Option<(u32, u64)>,
+    /// 最後一次看到有線網卡連上的時間（開機後毫秒數，包含睡眠）
+    last_seen_ms: Option<u64>,
+    /// 連續幾輪是降速的狀態
+    slow_rounds: u32,
     degraded: bool,
 }
 
 impl LinkSpeedWatch {
-    /// 降速或恢復時回傳要顯示的訊息
-    fn update(&mut self, net_if: Option<&NetIf>) -> Option<(String, bool)> {
+    /// 換了網路（例如換路由器）：之前的最高速度不能拿來比
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// 降速或恢復時回傳要顯示的訊息。`now_ms` 是開機後的毫秒數（包含睡眠）
+    fn update(&mut self, net_if: Option<&NetIf>, now_ms: u64) -> Option<(String, bool)> {
         let n =
             net_if.filter(|n| n.kind == IfKind::Ethernet && n.connected() && n.speed_bps > 0)?;
+        if self
+            .last_seen_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) >= LINK_FORGET_MS)
+        {
+            self.reset();
+        }
+        self.last_seen_ms = Some(now_ms);
         let best = match self.best {
             Some((index, best)) if index == n.index => best.max(n.speed_bps),
             _ => {
                 self.degraded = false;
+                self.slow_rounds = 0;
                 n.speed_bps
             }
         };
         self.best = Some((n.index, best));
-        let degraded = best >= FAST_LINK_BPS && n.speed_bps <= SLOW_LINK_BPS;
+        let slow = best >= FAST_LINK_BPS && n.speed_bps <= SLOW_LINK_BPS;
+        self.slow_rounds = if slow { self.slow_rounds + 1 } else { 0 };
+        let degraded = slow && (self.degraded || self.slow_rounds >= SLOW_LINK_ROUNDS);
         let was = std::mem::replace(&mut self.degraded, degraded);
         match (was, degraded) {
             (false, true) => Some((
@@ -153,15 +199,6 @@ impl LinkSpeedWatch {
             )),
             _ => None,
         }
-    }
-}
-
-/// 例如「1 Gbps」、「100 Mbps」
-fn fmt_speed(bps: u64) -> String {
-    if bps >= 1_000_000_000 {
-        format!("{} Gbps", bps / 1_000_000_000)
-    } else {
-        format!("{} Mbps", bps / 1_000_000)
     }
 }
 
@@ -199,12 +236,17 @@ impl NetworkWatcher {
     }
 
     pub fn update(&mut self) -> NetworkRound {
-        let route = route::best_route(INTERNET_TARGET);
-        // 有路由時查路由用的那張網卡（讀不到就當作未知，不要沿用舊網卡的資料）；
+        let mut route = route::best_route(INTERNET_TARGET);
+        // 有路由時查路由用的那張網卡（讀不到就當作未知，不要沿用舊網卡的資料）
+        let mut route_if = route.as_ref().and_then(|r| netif::interface(r.if_index));
+        if stale_route(route_if.as_ref(), self.last_if.as_ref()) {
+            route = None;
+            route_if = None;
+        }
         // 沒有路由時查最後一張用過的網卡，才知道是網路線拔掉還是只是沒有路由。
         // 一開始就沒有網路（還沒用過任何網卡）時，從實體網卡裡找出原因
         let net_if = match &route {
-            Some(r) => netif::interface(r.if_index),
+            Some(_) => route_if,
             None => match &self.last_if {
                 Some(n) => netif::interface(n.index),
                 None => offline_interface(),
@@ -234,7 +276,11 @@ impl NetworkWatcher {
             events.push((format!("改用 {} 上網", new.summary()), false));
         }
 
-        if !is_down && let Some(e) = self.link_speed.update(net_if.as_ref()) {
+        // 換了路由器就是換了網路，不是同一條網路線降速
+        if !is_down && route.as_ref().is_some_and(|r| r.next_hop != self.gateway) {
+            self.link_speed.reset();
+        }
+        if !is_down && let Some(e) = self.link_speed.update(net_if.as_ref(), time::uptime_ms().0) {
             events.push(e);
         }
 
@@ -305,6 +351,13 @@ impl NetworkWatcher {
             traffic,
         }
     }
+}
+
+/// 最佳路由指到一張沒有連線、也不是原本上網用的網卡：Wi-Fi 斷線後系統可能還留著它的預設路由，
+/// 網路線一斷，最佳路由就改指到這張 Wi-Fi。這種路由不能用，要當作沒有路由，
+/// 斷線原因看原本上網的網卡，不然會叫玩家去檢查 Wi-Fi，恢復時也會多一條「改用…上網」
+fn stale_route(route_if: Option<&NetIf>, last_if: Option<&NetIf>) -> bool {
+    route_if.is_some_and(|n| !n.connected() && last_if.is_none_or(|l| l.index != n.index))
 }
 
 /// 路由器位址；沒有路由器時說明可能的原因
@@ -401,29 +454,152 @@ mod tests {
     }
 
     #[test]
+    fn traffic_ignores_counter_jumping_back() {
+        // 重新連線時計數器暫時變小，下一輪又跳回累計值：跳回來的差值不是流量
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut m = TrafficMeter::default();
+        m.update(Some(&card(1, 0, 1_000_000_000, 0)), at(0));
+        assert_eq!(m.update(Some(&card(1, 0, 0, 0)), at(2)), None);
+        assert_eq!(m.update(Some(&card(1, 0, 1_000_000_000, 0)), at(4)), None);
+        // 之後恢復正常計算
+        let r = m
+            .update(Some(&card(1, 0, 1_010_000_000, 0)), at(6))
+            .unwrap();
+        assert_eq!(r.rx_bps, 40_000_000);
+    }
+
+    #[test]
+    fn traffic_rejects_rate_above_link_speed() {
+        let t0 = Instant::now();
+        let mut m = TrafficMeter::default();
+        let gbps = 1_000_000_000;
+        m.update(Some(&card(1, gbps, 0, 0)), t0);
+        // 2 秒收 1 GB = 4 Gbps，網卡只有 1 Gbps
+        assert_eq!(
+            m.update(
+                Some(&card(1, gbps, 1_000_000_000, 0)),
+                t0 + Duration::from_secs(2)
+            ),
+            None
+        );
+        // 接近連線速度的真實流量照算
+        let r = m
+            .update(
+                Some(&card(1, gbps, 1_200_000_000, 0)),
+                t0 + Duration::from_secs(4),
+            )
+            .unwrap();
+        assert_eq!(r.rx_bps, 800_000_000);
+    }
+
+    #[test]
+    fn traffic_skips_disconnected_adapter() {
+        let t0 = Instant::now();
+        let mut m = TrafficMeter::default();
+        let mut down = card(1, 0, 0, 0);
+        down.media_connected = false;
+        m.update(Some(&down), t0);
+        // 斷線時的讀數不當基準：重新連上的第一輪只記下讀數
+        assert_eq!(
+            m.update(
+                Some(&card(1, 0, 1_000_000_000, 0)),
+                t0 + Duration::from_secs(2)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_route_to_disconnected_wifi() {
+        let wired = card(1, 1_000_000_000, 0, 0);
+        let mut wifi = card(2, 0, 0, 0);
+        wifi.kind = IfKind::Wifi;
+        wifi.media_connected = false;
+        // 網路線斷了，路由改指到早就斷線的 Wi-Fi：不能用
+        assert!(stale_route(Some(&wifi), Some(&wired)));
+        // 原本就用 Wi-Fi 上網、Wi-Fi 斷了：原因就是這張 Wi-Fi
+        assert!(!stale_route(Some(&wifi), Some(&wifi)));
+        // 有連線的網卡、或讀不到網卡：照原本的路由
+        assert!(!stale_route(Some(&wired), Some(&wifi)));
+        assert!(!stale_route(None, Some(&wired)));
+        // 啟動時就沒有網路：從實體網卡裡找原因
+        assert!(stale_route(Some(&wifi), None));
+    }
+
+    #[test]
     fn link_speed_drop_reported_once_then_recovery() {
         let mut w = LinkSpeedWatch::default();
-        assert!(w.update(Some(&card(1, 1_000_000_000, 0, 0))).is_none());
-        let (text, severe) = w.update(Some(&card(1, 100_000_000, 0, 0))).unwrap();
+        assert!(w.update(Some(&card(1, 1_000_000_000, 0, 0)), 0).is_none());
+        let slow = card(1, 100_000_000, 0, 0);
+        // 要連續 SLOW_LINK_ROUNDS 輪才回報
+        for i in 1..SLOW_LINK_ROUNDS {
+            assert!(w.update(Some(&slow), i as u64 * 2_000).is_none());
+        }
+        let (text, severe) = w.update(Some(&slow), 10_000).unwrap();
         assert!(severe && text.contains("1 Gbps") && text.contains("100 Mbps"));
-        assert!(w.update(Some(&card(1, 100_000_000, 0, 0))).is_none());
+        assert!(w.update(Some(&slow), 12_000).is_none());
         assert!(
-            w.update(Some(&card(1, 1_000_000_000, 0, 0)))
+            w.update(Some(&card(1, 1_000_000_000, 0, 0)), 14_000)
                 .is_some_and(|(_, s)| !s)
         );
     }
 
     #[test]
+    fn link_speed_ignores_brief_renegotiation() {
+        let mut w = LinkSpeedWatch::default();
+        w.update(Some(&card(1, 1_000_000_000, 0, 0)), 0);
+        // 睡眠恢復時短暫協商在 100 Mbps，幾秒後回到 1 Gbps
+        assert!(w.update(Some(&card(1, 100_000_000, 0, 0)), 2_000).is_none());
+        assert!(w.update(Some(&card(1, 100_000_000, 0, 0)), 4_000).is_none());
+        assert!(
+            w.update(Some(&card(1, 1_000_000_000, 0, 0)), 6_000)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn link_speed_forgets_after_long_disconnect() {
+        let mut w = LinkSpeedWatch::default();
+        w.update(Some(&card(1, 1_000_000_000, 0, 0)), 0);
+        // 拔掉網路線（或睡眠）10 分鐘後接到 100 Mbps 的交換器：不是降速
+        let slow = card(1, 100_000_000, 0, 0);
+        for i in 0..SLOW_LINK_ROUNDS * 2 {
+            assert!(w.update(Some(&slow), 600_000 + i as u64 * 2_000).is_none());
+        }
+        // 短暫斷線（網路線接觸不良）後掉到 100 Mbps：還是要回報
+        let mut w = LinkSpeedWatch::default();
+        w.update(Some(&card(1, 1_000_000_000, 0, 0)), 0);
+        let reported = (0..SLOW_LINK_ROUNDS)
+            .any(|i| w.update(Some(&slow), 20_000 + i as u64 * 2_000).is_some());
+        assert!(reported);
+    }
+
+    #[test]
     fn link_speed_ignores_other_adapter_and_wifi() {
         let mut w = LinkSpeedWatch::default();
-        w.update(Some(&card(1, 1_000_000_000, 0, 0)));
+        w.update(Some(&card(1, 1_000_000_000, 0, 0)), 0);
         // 換到另一張只有 100 Mbps 的網卡：不是降速
-        assert!(w.update(Some(&card(2, 100_000_000, 0, 0))).is_none());
+        for i in 1..=SLOW_LINK_ROUNDS * 2 {
+            assert!(
+                w.update(Some(&card(2, 100_000_000, 0, 0)), i as u64 * 2_000)
+                    .is_none()
+            );
+        }
         let mut wifi = card(3, 1_000_000_000, 0, 0);
         wifi.kind = IfKind::Wifi;
         let mut w = LinkSpeedWatch::default();
-        w.update(Some(&wifi));
+        w.update(Some(&wifi), 0);
         wifi.speed_bps = 50_000_000;
-        assert!(w.update(Some(&wifi)).is_none());
+        assert!(w.update(Some(&wifi), 2_000).is_none());
+    }
+
+    #[test]
+    fn speed_text_keeps_decimal() {
+        assert_eq!(fmt_speed(1_000_000_000), "1 Gbps");
+        assert_eq!(fmt_speed(2_500_000_000), "2.5 Gbps");
+        assert_eq!(fmt_speed(10_000_000_000), "10 Gbps");
+        assert_eq!(fmt_speed(100_000_000), "100 Mbps");
+        assert_eq!(fmt_speed(866_700_000), "866 Mbps");
     }
 }
