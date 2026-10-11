@@ -19,8 +19,9 @@ pub const AGGREGATE_ROUNDS: u32 = 30;
 pub const MAX_HOPS: u8 = 20;
 /// 目標本身連得上，但路徑最後幾跳連續這麼多輪沒有回應，就當作路徑變短、那幾跳已經不在路徑上
 const STALE_ROUNDS: u32 = 5;
-/// 某一跳換成新位址、連續這麼多次回應都是新位址（15 × 2 秒 = 30 秒）才算路由真的變了。
-/// 負載平衡會讓同一跳在幾個位址間輪流出現，舊位址再出現就重新計算，不會被當成路由變動
+/// 某一跳連續這麼多次回應都不是原本的位址（15 × 2 秒 = 30 秒）才算路由真的變了。
+/// 負載平衡會讓同一跳在幾個位址間輪流出現，舊位址再出現就重新計算，不會被當成路由變動；
+/// 新路徑在幾個新位址間輪流出現也算數，不用同一個新位址連續出現
 const ROUTE_CONFIRM_ROUNDS: u32 = 15;
 
 struct HopState {
@@ -33,7 +34,7 @@ struct HopState {
     silent_rounds: u32,
     /// 目前認定的路徑上這一跳的位址
     stable: Option<Ipv4Addr>,
-    /// 跟 stable 不同的新位址，以及連續出現幾次
+    /// 最近一次跟 stable 不同的位址，以及連續幾次回應都不是 stable
     candidate: Option<(Ipv4Addr, u32)>,
 }
 
@@ -94,8 +95,10 @@ pub struct HopTracker {
     target: Option<Ipv4Addr>,
     hops: Vec<HopState>,
     rounds: u32,
-    /// 這一輪確認的路由變動，由 take_route_change 取走
+    /// 已確認、還沒取走的路由變動。同一次變動的各跳不一定同一輪確認，等到都確認完才一起取走
     changed: Vec<(u8, Ipv4Addr, Ipv4Addr)>,
+    /// 第一跳確認後過了幾輪；其他跳一直沒確認完（例如負載平衡讓位址一直在換）時，最多等這麼久
+    changed_wait: u32,
 }
 
 impl HopState {
@@ -109,10 +112,7 @@ impl HopState {
             self.candidate = None;
             return None;
         }
-        let n = match self.candidate {
-            Some((c, n)) if c == addr => n + 1,
-            _ => 1,
-        };
+        let n = self.candidate.map_or(1, |(_, n)| n + 1);
         if n < ROUTE_CONFIRM_ROUNDS {
             self.candidate = Some((addr, n));
             return None;
@@ -145,6 +145,7 @@ impl HopTracker {
         self.hops.clear();
         self.rounds = 0;
         self.changed.clear();
+        self.changed_wait = 0;
         flushed
     }
 
@@ -216,6 +217,10 @@ impl HopTracker {
             }
         }
 
+        if !self.changed.is_empty() {
+            self.changed_wait += 1;
+        }
+
         self.rounds += 1;
         if self.rounds < AGGREGATE_ROUNDS {
             return None;
@@ -228,8 +233,13 @@ impl HopTracker {
         self.hops.iter().any(|h| h.candidate.is_some())
     }
 
-    /// 取走這一輪確認的路由變動：(跳數, 舊位址, 新位址)
+    /// 取走已確認的路由變動：(跳數, 舊位址, 新位址)。
+    /// 還有其他跳正在換位址時先不取，同一次變動的各跳一起回報（最多等 ROUTE_CONFIRM_ROUNDS 輪）
     pub fn take_route_change(&mut self) -> Vec<(u8, Ipv4Addr, Ipv4Addr)> {
+        if self.route_pending() && self.changed_wait < ROUTE_CONFIRM_ROUNDS {
+            return Vec::new();
+        }
+        self.changed_wait = 0;
         std::mem::take(&mut self.changed)
     }
 
@@ -241,6 +251,7 @@ impl HopTracker {
             h.candidate = None;
         }
         self.changed.clear();
+        self.changed_wait = 0;
     }
 
     /// 這一分鐘的彙總，並重新開始累計
@@ -361,6 +372,62 @@ mod tests {
             t.record(&addr_trace([1, x, 1]), true);
             assert!(t.take_route_change().is_empty());
         }
+    }
+
+    #[test]
+    fn load_balanced_new_route_is_confirmed() {
+        let mut t = HopTracker::default();
+        t.set_target(Some(Ipv4Addr::new(10, 9, 9, 9)));
+        t.record(&addr_trace([1, 1, 1]), true);
+        // 第 2 跳換到新路徑，新路徑在兩個位址間輪流出現，舊位址不再出現
+        let mut changes = Vec::new();
+        for i in 0..ROUTE_CONFIRM_ROUNDS {
+            t.record(&addr_trace([1, 2 + (i % 2) as u8, 1]), true);
+            changes.extend(t.take_route_change());
+        }
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].1, Ipv4Addr::new(10, 0, 1, 1));
+        assert!(!t.route_pending());
+    }
+
+    #[test]
+    fn hops_of_one_change_are_reported_together() {
+        let mut t = HopTracker::default();
+        t.set_target(Some(Ipv4Addr::new(10, 9, 9, 9)));
+        t.record(&addr_trace([1, 1, 1]), true);
+        // 第 2 跳先換，第 3 跳晚 3 輪才換（例如有時不回應）
+        for _ in 0..3 {
+            t.record(&addr_trace([1, 2, 1]), true);
+            assert!(t.take_route_change().is_empty());
+        }
+        let mut reported = Vec::new();
+        for _ in 0..ROUTE_CONFIRM_ROUNDS {
+            t.record(&addr_trace([1, 2, 2]), true);
+            let c = t.take_route_change();
+            if !c.is_empty() {
+                reported.push(c);
+            }
+        }
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].len(), 2);
+    }
+
+    #[test]
+    fn route_change_waits_at_most_confirm_rounds_for_other_hops() {
+        let mut t = HopTracker::default();
+        t.set_target(Some(Ipv4Addr::new(10, 9, 9, 9)));
+        t.record(&addr_trace([1, 1, 1]), true);
+        for _ in 0..ROUTE_CONFIRM_ROUNDS {
+            t.record(&addr_trace([1, 2, 1]), true);
+        }
+        // 第 2 跳已確認；第 3 跳負載平衡一直在換，不能讓第 2 跳永遠報不出來
+        let mut reported = false;
+        for i in 0..ROUTE_CONFIRM_ROUNDS + 1 {
+            let x = if i % 3 == 0 { 1 } else { 2 };
+            t.record(&addr_trace([1, 2, x]), true);
+            reported |= !t.take_route_change().is_empty();
+        }
+        assert!(reported);
     }
 
     #[test]
