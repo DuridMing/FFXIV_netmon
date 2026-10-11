@@ -214,12 +214,17 @@ impl NetworkWatcher {
     }
 
     pub fn update(&mut self) -> NetworkRound {
-        let route = route::best_route(INTERNET_TARGET);
-        // 有路由時查路由用的那張網卡（讀不到就當作未知，不要沿用舊網卡的資料）；
+        let mut route = route::best_route(INTERNET_TARGET);
+        // 有路由時查路由用的那張網卡（讀不到就當作未知，不要沿用舊網卡的資料）
+        let mut route_if = route.as_ref().and_then(|r| netif::interface(r.if_index));
+        if stale_route(route_if.as_ref(), self.last_if.as_ref()) {
+            route = None;
+            route_if = None;
+        }
         // 沒有路由時查最後一張用過的網卡，才知道是網路線拔掉還是只是沒有路由。
         // 一開始就沒有網路（還沒用過任何網卡）時，從實體網卡裡找出原因
         let net_if = match &route {
-            Some(r) => netif::interface(r.if_index),
+            Some(_) => route_if,
             None => match &self.last_if {
                 Some(n) => netif::interface(n.index),
                 None => offline_interface(),
@@ -326,6 +331,13 @@ impl NetworkWatcher {
     }
 }
 
+/// 最佳路由指到一張沒有連線、也不是原本上網用的網卡：Wi-Fi 斷線後系統可能還留著它的預設路由，
+/// 網路線一斷，最佳路由就改指到這張 Wi-Fi。這種路由不能用，要當作沒有路由，
+/// 斷線原因看原本上網的網卡，不然會叫玩家去檢查 Wi-Fi，恢復時也會多一條「改用…上網」
+fn stale_route(route_if: Option<&NetIf>, last_if: Option<&NetIf>) -> bool {
+    route_if.is_some_and(|n| !n.connected() && last_if.is_none_or(|l| l.index != n.index))
+}
+
 /// 路由器位址；沒有路由器時說明可能的原因
 fn fmt_gateway(a: Option<Ipv4Addr>) -> String {
     a.map_or("無（電腦直接撥號或使用 VPN）".into(), |a| {
@@ -417,6 +429,23 @@ mod tests {
             m.update(Some(&card(1, 0, 10, 0)), t0 + Duration::from_secs(2)),
             None
         );
+    }
+
+    #[test]
+    fn stale_route_to_disconnected_wifi() {
+        let wired = card(1, 1_000_000_000, 0, 0);
+        let mut wifi = card(2, 0, 0, 0);
+        wifi.kind = IfKind::Wifi;
+        wifi.media_connected = false;
+        // 網路線斷了，路由改指到早就斷線的 Wi-Fi：不能用
+        assert!(stale_route(Some(&wifi), Some(&wired)));
+        // 原本就用 Wi-Fi 上網、Wi-Fi 斷了：原因就是這張 Wi-Fi
+        assert!(!stale_route(Some(&wifi), Some(&wifi)));
+        // 有連線的網卡、或讀不到網卡：照原本的路由
+        assert!(!stale_route(Some(&wired), Some(&wifi)));
+        assert!(!stale_route(None, Some(&wired)));
+        // 啟動時就沒有網路：從實體網卡裡找原因
+        assert!(stale_route(Some(&wifi), None));
     }
 
     #[test]
