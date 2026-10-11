@@ -458,6 +458,8 @@ fn run(
     let mut disconnect: Option<Disconnect> = None;
     // 路由開始變動前的遊戲伺服器平均延遲，確認變動後拿來比較
     let mut route_before: Option<f64> = None;
+    // 延遲變高、等著回報成異常事件的路由變動（同一輪有斷線時會晚幾輪才回報）
+    let mut slower_route: Option<RouteChange> = None;
     let mut sleep_clock = SleepClock::default();
     // 還剩幾輪算「剛從睡眠恢復」
     let mut resume_rounds: u32 = 0;
@@ -617,11 +619,11 @@ fn run(
             route_before = None;
         }
         let changed_hops = hop_tracker.take_route_change();
-        let mut route_change = None;
         if !changed_hops.is_empty() {
             let change = RouteChange {
                 hops: changed_hops,
-                before_ms: route_before.take(),
+                // 變動還沒全部確認完時，之後確認的節點也要跟同一個變動前的延遲比較
+                before_ms: route_before,
                 after_ms: layers[GAME]
                     .window
                     .summary_last(RECENT)
@@ -638,9 +640,10 @@ fn run(
             }
             if change.slower() {
                 detector.route_changed();
+                slower_route = Some(change);
             }
-            route_change = Some(change);
-        } else if !hop_tracker.route_pending() {
+        }
+        if !hop_tracker.route_pending() {
             route_before = None;
         } else if route_before.is_none() {
             // 剛開始換位址：最新一筆可能已經是新路徑，不算進變動前的平均
@@ -663,6 +666,7 @@ fn run(
         let hop_loss_origin = hop_tracker.loss_origin();
         let kind = detector.check(windows, game_disconnected, net.signal, tcp_report.as_ref());
         let mut incident_record = None;
+        let route_change = slower_route.take_if(|_| kind == Some(IncidentKind::RouteChanged));
         if let Some(kind) = kind {
             let mut states = layers.each_ref().map(Layer::state);
             let mut targets = targets.clone();

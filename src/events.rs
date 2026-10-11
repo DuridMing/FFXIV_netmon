@@ -194,7 +194,6 @@ impl EventDetector {
         triggered.extend(lowest_spike.map(IncidentKind::LatencySpike));
 
         let game_disconnected = game_disconnected || std::mem::take(&mut self.pending_disconnect);
-        let route_changed = std::mem::take(&mut self.pending_route_change);
         let kind = if network.went_down {
             self.pending_disconnect = game_disconnected;
             Some(IncidentKind::NetworkDown)
@@ -202,7 +201,8 @@ impl EventDetector {
             Some(IncidentKind::GameDisconnected)
         } else if network.down {
             None
-        } else if route_changed {
+        } else if std::mem::take(&mut self.pending_route_change) {
+            // 只在這裡取走：同一輪有網路中斷或遊戲斷線時，路由變動留到之後回報，不會遺失
             // 同一輪的其他異常留到冷卻結束，還持續的話再回報
             for &kind in &triggered {
                 self.forget(kind);
@@ -617,5 +617,27 @@ mod resume_tests {
             Some(IncidentKind::RouteChanged)
         );
         assert_eq!(d.check(ws, false, UP, None), None);
+    }
+
+    #[test]
+    fn route_change_survives_same_round_disconnect() {
+        let mut d = EventDetector::default();
+        let ok: [Window; 4] = std::array::from_fn(|_| {
+            let mut w = Window::new(30);
+            for _ in 0..10 {
+                w.push(Some(10));
+            }
+            w
+        });
+        let ws = [&ok[0], &ok[1], &ok[2], &ok[3]];
+        d.route_changed();
+        assert_eq!(
+            d.check(ws, true, UP, None),
+            Some(IncidentKind::GameDisconnected)
+        );
+        assert_eq!(
+            d.check(ws, false, UP, None),
+            Some(IncidentKind::RouteChanged)
+        );
     }
 }
