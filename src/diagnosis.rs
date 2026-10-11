@@ -71,10 +71,19 @@ pub fn diagnose(kind: IncidentKind, layers: &[LayerState; 4], ctx: &Context) -> 
         _ => false,
     };
     if local_layers && let Some(t) = ctx.traffic.filter(|t| t.heavy()) {
-        text.push_str(&format!(
-            "這時候這台電腦本身正在大量傳輸（{}），例如 Steam／遊戲更新、Windows Update、雲端同步或直播，很可能就是它佔滿頻寬造成的；可以暫停或限制它的速度。",
-            t.text()
-        ));
+        // 只有遊戲伺服器延遲突增時，到外部網路的延遲是正常的：本機傳輸真的塞滿頻寬的話，
+        // ISP 和外部網路那兩層也會一起變慢，所以只附註、不當成主因
+        if kind == IncidentKind::LatencySpike(GAME) {
+            text.push_str(&format!(
+                "這時候這台電腦也正在大量傳輸（{}），不過到外部網路的延遲正常，比較不像是它造成的；如果常常這樣，可以試著暫停它看看。",
+                t.text()
+            ));
+        } else {
+            text.push_str(&format!(
+                "這時候這台電腦本身正在大量傳輸（{}），例如 Steam／遊戲更新、Windows Update、雲端同步或直播，很可能就是它佔滿頻寬造成的；可以暫停或限制它的速度。",
+                t.text()
+            ));
+        }
     }
     let home_issue = match kind {
         IncidentKind::LatencySpike(i) => i == GATEWAY,
@@ -318,6 +327,9 @@ mod tests {
         };
         let text = diagnose(IncidentKind::LatencySpike(GATEWAY), &layers, &ctx);
         assert!(text.contains("這台電腦本身正在大量傳輸（下載 80.0 Mbps"));
+        // 只有遊戲伺服器延遲突增：到外部網路正常，只附註、不說「很可能就是它」
+        let text = diagnose(IncidentKind::LatencySpike(GAME), &layers, &ctx);
+        assert!(text.contains("也正在大量傳輸") && !text.contains("很可能就是它"));
         // 只有遊戲伺服器掉包時跟本機流量無關
         let game = [good(), good(), good(), state(50.0, None)];
         assert!(!diagnose(IncidentKind::HighLoss(GAME), &game, &ctx).contains("大量傳輸"));
