@@ -55,7 +55,13 @@ pub struct Context<'a> {
 
 pub fn diagnose(kind: IncidentKind, layers: &[LayerState; 4], ctx: &Context) -> String {
     if kind == IncidentKind::GameDisconnected && ctx.resumed {
-        return "電腦剛從睡眠／休眠恢復：遊戲連線是在電腦睡眠期間中斷的，不是網路問題。".into();
+        return match ctx.network_down {
+            None => "電腦剛從睡眠／休眠恢復：遊戲連線是在電腦睡眠期間中斷的，不是網路問題。".into(),
+            // 恢復後網路還沒連上：通常幾秒內會好，但也可能就是網路出了問題，不能說跟網路無關
+            Some(reason) => format!(
+                "電腦剛從睡眠／休眠恢復：遊戲連線是在電腦睡眠期間中斷的。電腦網路目前還沒恢復（{reason}），通常幾秒內會自動重新連上；如果一直沒恢復，請檢查網路。"
+            ),
+        };
     }
     let mut text = diagnose_network(kind, layers, ctx);
     // 本機大量傳輸會塞滿家裡到 ISP 這一段，延遲突增和前三層的掉包都可能是它造成的
@@ -325,9 +331,17 @@ mod tests {
             network_down: Some("Wi-Fi 沒有連線"),
             ..Default::default()
         };
-        assert!(
-            diagnose(IncidentKind::GameDisconnected, &layers, &ctx).starts_with("電腦剛從睡眠")
-        );
+        let text = diagnose(IncidentKind::GameDisconnected, &layers, &ctx);
+        assert!(text.starts_with("電腦剛從睡眠"));
+        // 網路還沒恢復時不能說不是網路問題
+        assert!(text.contains("電腦網路目前還沒恢復（Wi-Fi 沒有連線）"));
+        assert!(!text.contains("不是網路問題"));
+        let ctx = Context {
+            resumed: true,
+            ..Default::default()
+        };
+        let text = diagnose(IncidentKind::GameDisconnected, &layers, &ctx);
+        assert!(text.contains("不是網路問題"));
     }
 
     #[test]

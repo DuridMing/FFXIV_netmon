@@ -38,8 +38,8 @@ const FLUSH_ROUNDS: usize = 30;
 const MAX_BUFFERED_ROUNDS: usize = 900;
 /// 每幾輪清一次超過保留天數的樣本（1800 × 2 秒 = 1 小時）
 const PRUNE_ROUNDS: usize = 1800;
-/// 兩輪之間隔了這麼久（正常是 2 秒）就是電腦剛從睡眠／休眠恢復
-const SLEEP_GAP_MS: i64 = 30_000;
+/// 兩次檢查之間電腦睡了這麼久，就當作剛從睡眠／休眠恢復
+const SLEEP_GAP_MS: u64 = 30_000;
 /// 從睡眠恢復後幾輪不判斷異常（10 × 2 秒 = 20 秒）：網卡重新連線、Wi-Fi 重新連上都要時間
 const RESUME_GRACE_ROUNDS: u32 = 10;
 /// 從睡眠恢復後幾輪內的遊戲斷線，都當作是睡眠造成的（60 × 2 秒 = 2 分鐘）。
@@ -458,8 +458,7 @@ fn run(
     let mut disconnect: Option<Disconnect> = None;
     // 路由開始變動前的遊戲伺服器平均延遲，確認變動後拿來比較
     let mut route_before: Option<f64> = None;
-    // 上一輪開始的時間（牆上時鐘，睡眠期間也會走）
-    let mut last_wall_ms: Option<i64> = None;
+    let mut sleep_clock = SleepClock::default();
     // 還剩幾輪算「剛從睡眠恢復」
     let mut resume_rounds: u32 = 0;
     let probe_workers: [Worker<Probe, Measured>; 4] =
@@ -468,29 +467,19 @@ fn run(
     loop {
         let round_start = Instant::now();
 
-        let wall_ms = storage::now_ms();
         resume_rounds = resume_rounds.saturating_sub(1);
-        if let Some(prev) = last_wall_ms
-            && wall_ms - prev >= SLEEP_GAP_MS
-        {
-            // 睡眠前的樣本跟現在無關；恢復期間網路還在重新連線，先不判斷異常
-            for layer in &mut layers {
-                layer.window.clear();
-            }
-            hop_tracker.reset_path();
+        if let Some(slept) = sleep_clock.check() {
             route_before = None;
-            detector.resumed(RESUME_GRACE_ROUNDS);
             resume_rounds = RESUME_NOTE_ROUNDS;
-            let text = format!(
-                "電腦從睡眠／休眠恢復（監測暫停了 {}），接下來 {} 秒先不判斷異常",
-                fmt_gap(wall_ms - prev),
-                RESUME_GRACE_ROUNDS as u64 * INTERVAL.as_secs()
-            );
-            if !send(event(text, false)) {
+            if !send(on_resume(
+                slept,
+                &mut layers,
+                &mut hop_tracker,
+                &mut detector,
+            )) {
                 return;
             }
         }
-        last_wall_ms = Some(wall_ms);
 
         let mut game_disconnected = false;
         let mut game_conn = None;
@@ -552,12 +541,27 @@ fn run(
             .zip(&probe_workers)
             .map(|(l, w)| l.probe.map(|p| w.start(p)))
             .collect();
-        let results: Vec<Option<Measured>> = probing
+        let mut results: Vec<Option<Measured>> = probing
             .iter()
             .zip(&probe_workers)
             .map(|(s, w)| s.map(|ok| ok.then(|| w.finish()).flatten().unwrap_or(Measured::Failed)))
             .collect();
-        let hop_trace: Option<Trace> = hop_started.then(|| hop_worker.finish()).flatten();
+        let mut hop_trace: Option<Trace> = hop_started.then(|| hop_worker.finish()).flatten();
+        // 量測途中睡著了：這輪的結果是跨越睡眠量到的，不算
+        if let Some(slept) = sleep_clock.check() {
+            results.fill(None);
+            hop_trace = None;
+            route_before = None;
+            resume_rounds = RESUME_NOTE_ROUNDS;
+            if !send(on_resume(
+                slept,
+                &mut layers,
+                &mut hop_tracker,
+                &mut detector,
+            )) {
+                return;
+            }
+        }
 
         // 結果要記到量測當時的目標：先寫進統計，之後才更新路由器／ISP 節點
         let ts_ms = storage::now_ms();
@@ -815,8 +819,49 @@ struct IncidentExtra<'a> {
     resumed: bool,
 }
 
+/// 偵測電腦睡眠：比較包含和不含睡眠的開機時間，系統校時不會影響
+#[derive(Default)]
+struct SleepClock {
+    last: Option<(u64, u64)>,
+}
+
+impl SleepClock {
+    /// 上次檢查到現在睡了多久（毫秒）；沒睡或不到 SLEEP_GAP_MS 回傳 None
+    fn check(&mut self) -> Option<u64> {
+        self.check_at(time::uptime_ms())
+    }
+
+    fn check_at(&mut self, now: (u64, u64)) -> Option<u64> {
+        let (total, unbiased) = self.last.replace(now)?;
+        let slept = (now.0 - total).saturating_sub(now.1 - unbiased);
+        (slept >= SLEEP_GAP_MS).then_some(slept)
+    }
+}
+
+/// 從睡眠恢復：睡眠前的樣本跟現在無關；恢復期間網路還在重新連線，先不判斷異常
+fn on_resume(
+    slept_ms: u64,
+    layers: &mut [Layer; 4],
+    hop_tracker: &mut HopTracker,
+    detector: &mut EventDetector,
+) -> MonitorMsg {
+    for layer in layers {
+        layer.window.clear();
+    }
+    hop_tracker.reset_path();
+    detector.resumed(RESUME_GRACE_ROUNDS);
+    event(
+        format!(
+            "電腦從睡眠／休眠恢復（監測暫停了 {}），接下來 {} 秒先不判斷異常",
+            fmt_gap(slept_ms),
+            RESUME_GRACE_ROUNDS as u64 * INTERVAL.as_secs()
+        ),
+        false,
+    )
+}
+
 /// 睡眠時間：「45 秒」、「12 分鐘」、「3 小時 5 分鐘」
-fn fmt_gap(ms: i64) -> String {
+fn fmt_gap(ms: u64) -> String {
     let secs = ms / 1000;
     match secs {
         ..120 => format!("{secs} 秒"),
@@ -989,6 +1034,20 @@ mod tests {
             in_octets: 0,
             out_octets: 0,
         }
+    }
+
+    #[test]
+    fn sleep_clock_counts_only_suspended_time() {
+        let mut c = SleepClock::default();
+        assert_eq!(c.check_at((1_000, 1_000)), None);
+        // 一般的一輪：兩個時間一起走
+        assert_eq!(c.check_at((3_000, 3_000)), None);
+        // 量測卡了 40 秒但沒有睡眠：不算
+        assert_eq!(c.check_at((43_000, 43_000)), None);
+        // 睡了 10 分鐘
+        assert_eq!(c.check_at((645_000, 45_000)), Some(600_000));
+        // 睡不到 SLEEP_GAP_MS 不算
+        assert_eq!(c.check_at((667_000, 47_000)), None);
     }
 
     #[test]
