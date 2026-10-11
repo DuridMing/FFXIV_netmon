@@ -305,7 +305,11 @@ fn run(opts: &Options) -> eframe::Result {
         Box::new(move |cc| {
             GRAPHICS_READY.store(true, Ordering::SeqCst);
             let ctx = cc.egui_ctx.clone();
-            let monitor = monitor::spawn(target, move || ctx.request_repaint());
+            // request_repaint() 每次都會讓 egui 連畫兩幀；量測資料只需要畫一幀。
+            // 給一點延遲就只畫一次（WARP 每畫一幀約 1.7 秒 CPU，減半很有感）
+            let monitor = monitor::spawn(target, move || {
+                ctx.request_repaint_after(Duration::from_millis(1))
+            });
 
             let (tray_tx, tray_rx) = crossbeam_channel::unbounded();
             let ctx = cc.egui_ctx.clone();
